@@ -1140,6 +1140,12 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
   int i = 0, offset = strlen("panasonic_heat_pump/main");
   const char *topic = message->topic;
 
+  /*
+   * This value has been overridden so ignore.
+   */
+  if(strstr(message->topic, "panasonic_heat_pump/main/Room_Thermostat_Temp") != NULL) {
+    return;
+  }
   if(strstr(message->topic, "woonkamer/temperature/temperature") != NULL) {
     topic = "panasonic_heat_pump/main/Room_Thermostat_Temp";
   }
