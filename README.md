@@ -10,7 +10,7 @@
 # ./start
 ```
 
-Place your rules in the repository rules folder called `rules.txt`.
+Place your rules in the repository root folder called `rules.txt`.
 
 Edit the `main.cpp` source file to match the IP or your broker and the MQTT topics of your HeishaMon.
 
