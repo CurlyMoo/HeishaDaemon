@@ -190,7 +190,7 @@ static int event_cb(struct rules_t *obj, const char *name) {
 
   printf("-- %s\n", name);
 
-  if(obj->caller > 0) {
+  if(obj->caller > 0 && name == NULL) {
     called = rules[obj->caller-1];
 
     obj->caller = 0;
