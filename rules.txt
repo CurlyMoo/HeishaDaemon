@@ -8,11 +8,11 @@ on System#Boot then
 end
 
 on setThermostaat then
-	#nachtverlaging = coalesce(#nachtverlaging, -2);
+	#nachtverlaging = -2;
 	#T1 = 21.25;
 	#T2 = 20.25;
 
-	if @Outside_Temp >= 0 && (%hour <= 6 || %hour >= 22) && #nachtverlaging != 0 then
+	if @Outside_Temp >= 0 && (%hour <= 6 || %hour >= 22) then
 		#T1 = #T1 + #nachtverlaging;
 		#T2 = #T2 + #nachtverlaging;
 		#nachtverlaging = 0;
@@ -88,7 +88,9 @@ on @Defrosting_State then
 	if @Defrosting_State == 1 then
 		#defrost = 1;
 	else
-		setTimer(1, 60);
+		if #defrost == 1 then
+			setTimer(1, 60);
+		end
 	end
 end
 
@@ -113,6 +115,7 @@ on schakelWP then
 		WPAan();
 	end
 
+	resetTeller();
 	resetDummy();
 end
 
@@ -220,7 +223,6 @@ on @Room_Thermostat_Temp then
 			if #tellerUit > 5 then
 				#WPAan = 0;
 				#WPUit = 1;
-				resetTeller();
 				schakelWP();
 			end
 		end
@@ -232,7 +234,6 @@ on @Room_Thermostat_Temp then
 				if #tellerAan > 5 || @Outside_Temp <= 2 then
 					#WPAan = 1;
 					#WPUit = 0;
-					resetTeller();
 					schakelWP();
 				end
 			end
