@@ -1082,7 +1082,7 @@ void handle_alarm(int sig){
   local_time = localtime(&current_time);
 
   /* Display the local time */
-  printf("\n_______ %s %s\n", __FUNCTION__, asctime(local_time));
+  printf("\n_______ %s %s ", __FUNCTION__, asctime(local_time));
 
   if((node = timerqueue_pop()) != NULL) {
     nr = node->nr;
@@ -1094,7 +1094,7 @@ void handle_alarm(int sig){
     }
     memset(name, 0, i+2);
     snprintf(name, i+1, "timer=%d", nr);
-
+    printf("%s\n", name);
     if((node = timerqueue_peek()) != NULL) {
       if(node->sec <= 0 && node->usec <= 0) {
         node->usec = 1;
@@ -1125,6 +1125,7 @@ void handle_alarm(int sig){
     }
     FREE(name);
   } else {
+    printf("\n");
     it_val.it_value.tv_sec = 0;
     it_val.it_value.tv_usec = 0;
     it_val.it_interval = it_val.it_value;
@@ -1134,6 +1135,9 @@ void handle_alarm(int sig){
 
 void connect_callback(struct mosquitto *mosq, void *obj, int result) {
 	printf("connect callback, rc=%d\n\n", result);
+
+	mosquitto_subscribe(mosq, NULL, topic, 0);
+	mosquitto_subscribe(mosq, NULL, "woonkamer/temperature/temperature", 0);
 }
 
 void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message) {
@@ -1305,9 +1309,6 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Unable to connect to mqtt broker\n");
 		exit(1);
 	}
-
-	mosquitto_subscribe(mosq, NULL, topic, 0);
-	mosquitto_subscribe(mosq, NULL, "woonkamer/temperature/temperature", 0);
 
   int foo = 0;
   while(run){
