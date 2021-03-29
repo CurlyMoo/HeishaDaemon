@@ -64,7 +64,7 @@ on setNewTemp then
 	if #newTargetTemp > #maxTa then
 		#newTargetTemp = #maxTa;
 	end
-	if #onTemp == 3 then
+	if #onTemp == 3 && #outletOnTemp == 1 then
 		if #newTargetTemp < #maxTa then
 			#newTargetTemp = #maxTa - 1;
 		end
