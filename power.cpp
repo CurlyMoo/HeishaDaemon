@@ -20,13 +20,14 @@
 #include "rules.h"
 
 int event_operator_power_callback(struct rules_t *obj, int a, int b, int *ret) {
-  *ret = obj->nrbytes;
+  *ret = obj->varstack.nrbytes;
 
-  if((obj->bytecode[a]) == VNULL || (obj->bytecode[b]) == VNULL) {
-    if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+sizeof(struct vm_vnull_t))) == NULL) {
+  if((obj->varstack.buffer[a]) == VNULL || (obj->varstack.buffer[b]) == VNULL) {
+    unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vnull_t));
+    if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
       OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
     }
-    struct vm_vnull_t *out = (struct vm_vnull_t *)&obj->bytecode[obj->nrbytes];
+    struct vm_vnull_t *out = (struct vm_vnull_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
 
     out->ret = 0;
     out->type = VNULL;
@@ -37,28 +38,84 @@ int event_operator_power_callback(struct rules_t *obj, int a, int b, int *ret) {
 #endif
 /* LCOV_EXCL_STOP*/
 
-    obj->nrbytes += sizeof(struct vm_vnull_t);
-  } else if((obj->bytecode[a]) == VCHAR || (obj->bytecode[b]) == VCHAR) {
-  } else if((obj->bytecode[a]) == VFLOAT || (obj->bytecode[b]) == VFLOAT) {
-  } else {
-    if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+sizeof(struct vm_vinteger_t))) == NULL) {
+    obj->varstack.nrbytes = size;
+    obj->varstack.bufsize = alignedbuffer(size);
+  } else if((obj->varstack.buffer[a]) == VCHAR || (obj->varstack.buffer[b]) == VCHAR) {
+  } else if((obj->varstack.buffer[a]) == VFLOAT || (obj->varstack.buffer[b]) == VFLOAT) {
+    float f = 0;
+    int i = 0;
+    unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vfloat_t));
+    if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
       OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
     }
-    struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->bytecode[obj->nrbytes];
-    struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->bytecode[a];
-    struct vm_vinteger_t *nb = (struct vm_vinteger_t *)&obj->bytecode[b];
+
+    struct vm_vfloat_t *out = (struct vm_vfloat_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
+
+    if((obj->varstack.buffer[a]) == VFLOAT) {
+      struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->varstack.buffer[a];
+      f = na->value;
+    } else if((obj->varstack.buffer[a]) == VINTEGER) {
+      struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[a];
+      i = na->value;
+    }
+    if((obj->varstack.buffer[b]) == VFLOAT) {
+      struct vm_vfloat_t *nb = (struct vm_vfloat_t *)&obj->varstack.buffer[b];
+      if((obj->varstack.buffer[a]) == VFLOAT) {
+        out->value = pow(f, nb->value);
+/* LCOV_EXCL_START*/
+#ifdef DEBUG
+        printf("1 %s %g %g\n", __FUNCTION__,f, nb->value);
+#endif
+/* LCOV_EXCL_STOP*/
+      } else if((obj->varstack.buffer[a]) == VINTEGER) {
+        out->value = pow(i, nb->value);
+/* LCOV_EXCL_START*/
+#ifdef DEBUG
+        printf("2 %s %d %g\n", __FUNCTION__,i, nb->value);
+#endif
+/* LCOV_EXCL_STOP*/
+      }
+    } else if((obj->varstack.buffer[b]) == VINTEGER) {
+      struct vm_vinteger_t *nb = (struct vm_vinteger_t *)&obj->varstack.buffer[b];
+      out->value = pow(f, nb->value);
+/* LCOV_EXCL_START*/
+#ifdef DEBUG
+      printf("3 %s %g %d\n", __FUNCTION__,f, nb->value);
+#endif
+/* LCOV_EXCL_STOP*/
+    }
+
+    out->ret = 0;
+    out->type = VFLOAT;
 
 /* LCOV_EXCL_START*/
 #ifdef DEBUG
-    printf("%s %d %d\n", __FUNCTION__, na->value, nb->value);
+    printf("%s %g %d\n", __FUNCTION__, f, i);
 #endif
 /* LCOV_EXCL_STOP*/
 
+    obj->varstack.nrbytes = size;
+    obj->varstack.bufsize = alignedbuffer(size);
+  } else if((obj->varstack.buffer[a]) == VINTEGER && (obj->varstack.buffer[b]) == VINTEGER) {
+    unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+    if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
+      OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+    }
+    struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
+
+    struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[a];
+    struct vm_vinteger_t *nb = (struct vm_vinteger_t *)&obj->varstack.buffer[b];
     out->ret = 0;
     out->type = VINTEGER;
     out->value = pow(na->value, nb->value);
 
-    obj->nrbytes += sizeof(struct vm_vinteger_t);
+/* LCOV_EXCL_START*/
+#ifdef DEBUG
+    printf("4 %s %d %d\n", __FUNCTION__, na->value, nb->value);
+#endif
+/* LCOV_EXCL_STOP*/
+    obj->varstack.nrbytes = size;
+    obj->varstack.bufsize = alignedbuffer(size);
   }
 
 

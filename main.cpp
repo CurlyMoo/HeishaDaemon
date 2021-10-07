@@ -26,6 +26,29 @@
 #include "decode.h"
 #include "timerqueue.h"
 
+typedef struct vm_gvchar_t {
+  VM_GENERIC_FIELDS
+  uint8_t rule;
+  char value[];
+} __attribute__((packed)) vm_gvchar_t;
+
+typedef struct vm_gvnull_t {
+  VM_GENERIC_FIELDS
+  uint8_t rule;
+} __attribute__((packed)) vm_gvnull_t;
+
+typedef struct vm_gvinteger_t {
+  VM_GENERIC_FIELDS
+  uint8_t rule;
+  int value;
+} __attribute__((packed)) vm_gvinteger_t;
+
+typedef struct vm_gvfloat_t {
+  VM_GENERIC_FIELDS
+  uint8_t rule;
+  float value;
+} __attribute__((packed)) vm_gvfloat_t;
+
 struct timerqueue_t **timerqueue = NULL;
 struct timerqueue_t timerqueue_prev;
 int timerqueue_size = 0;
@@ -45,27 +68,19 @@ static char out[1024];
 char hp_values[NUMBER_OF_TOPICS][255];
 
 typedef struct varstack_t {
+  unsigned int nrbytes;
   unsigned char *stack;
-  int nrbytes;
 } varstack_t;
 
 static struct varstack_t global_varstack;
 
 static struct vm_vinteger_t vinteger;
 static struct vm_vfloat_t vfloat;
+static struct vm_vnull_t vnull;
 
 struct rule_options_t rule_options;
 
 static void vm_global_value_prt(char *out, int size);
-
-static int alignedbytes(int v) {
-#ifdef ESP8266
-  while((v++ % 4) != 0);
-  return --v;
-#else
-  return v;
-#endif
-}
 
 static int strnicmp(char const *a, char const *b, size_t len) {
   int i = 0;
@@ -102,7 +117,16 @@ static int stricmp(char const *a, char const *b) {
   return -1;
 }
 
-static int is_variable(struct rules_t *obj, const char *text, int *pos, int size) {
+static int get_event(struct rules_t *obj) {
+  struct vm_tstart_t *start = (struct vm_tstart_t *)&obj->ast.buffer[0];
+  if(obj->ast.buffer[start->go] != TEVENT) {
+    return -1;
+  } else {
+    return start->go;
+  }
+}
+
+static int is_variable(char *text, unsigned int *pos, unsigned int size) {
   int i = 1, x = 0, match = 0;
   if(text[*pos] == '$' || text[*pos] == '#' || text[*pos] == '@' || text[*pos] == '%') {
     while(isalnum(text[*pos+i])) {
@@ -112,6 +136,8 @@ static int is_variable(struct rules_t *obj, const char *text, int *pos, int size
     if(text[*pos] == '%') {
       if(strnicmp(&text[(*pos)+1], "hour", 4) == 0) {
         return 5;
+      }if(strnicmp(&text[(*pos)+1], "month", 5) == 0) {
+        return 6;
       }
     }
 
@@ -143,7 +169,7 @@ static int is_variable(struct rules_t *obj, const char *text, int *pos, int size
   return -1;
 }
 
-static int is_event(struct rules_t *obj, const char *text, int *pos, int size) {
+static int is_event(char *text, unsigned int *pos, unsigned int size) {
   int i = 1, x = 0, match = 0;
   if(text[*pos] == '@') {
     int nrcommands = sizeof(commands)/sizeof(commands[0]);
@@ -172,9 +198,9 @@ static int is_event(struct rules_t *obj, const char *text, int *pos, int size) {
 
   // for(x=0;x<nrrules;x++) {
     // for(i=0;i<rules[x]->nrbytes;i++) {
-      // if(rules[x]->bytecode[0] == TEVENT) {
-        // if(strnicmp(&text[(*pos)], (char *)&rules[x]->bytecode[1], strlen((char *)&rules[x]->bytecode[1])) == 0) {
-          // return strlen((char *)&rules[x]->bytecode[1]);
+      // if(rules[x]->ast.buffer[0] == TEVENT) {
+        // if(strnicmp(&text[(*pos)], (char *)&rules[x]->ast.buffer[1], strlen((char *)&rules[x]->ast.buffer[1])) == 0) {
+          // return strlen((char *)&rules[x]->ast.buffer[1]);
         // }
       // }
       // break;
@@ -184,22 +210,22 @@ static int is_event(struct rules_t *obj, const char *text, int *pos, int size) {
   return size;
 }
 
-static int event_cb(struct rules_t *obj, const char *name) {
+static int event_cb(struct rules_t *obj, char *name) {
   struct rules_t *called = NULL;
   int i = 0, x = 0;
 
-  printf("-- %s\n", name);
-
-  if(obj->caller > 0) {
+  if(obj->caller > 0 && name == NULL) {
     called = rules[obj->caller-1];
 
     obj->caller = 0;
 
+    printf("...1 %p NULL\n", obj);
+
     return rule_run(called, 0);
   } else {
     for(x=0;x<nrrules;x++) {
-      if(rules[x]->bytecode[0] == TEVENT) {
-        if(strnicmp(name, (char *)&rules[x]->bytecode[1], strlen((char *)&rules[x]->bytecode[1])) == 0) {
+      if(get_event(rules[x]) > -1) {
+        if(strnicmp(name, (char *)&rules[x]->ast.buffer[get_event(rules[x])+5], strlen((char *)&rules[x]->ast.buffer[get_event(rules[x])+5])) == 0) {
           called = rules[x];
           break;
         }
@@ -208,6 +234,8 @@ static int event_cb(struct rules_t *obj, const char *name) {
         break;
       }
     }
+
+    printf("...2 %p %s %p\n", obj, name, called);
 
     if(called != NULL) {
       called->caller = obj->nr;
@@ -221,52 +249,52 @@ static int event_cb(struct rules_t *obj, const char *name) {
 
 static void vm_value_clr(struct rules_t *obj, uint16_t token) {
   struct varstack_t *varstack = (struct varstack_t *)obj->userdata;
-  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->bytecode[token];
+  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->ast.buffer[token];
 
-  if(obj->bytecode[var->token + 1] == '$') {
-    var->value = 0;
+  if(var->token[1] == '$') {
+    obj->valstack.buffer[var->value] = 0;
   }
 }
 
 static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
   struct varstack_t *varstack = (struct varstack_t *)obj->userdata;
-  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->bytecode[token];
+  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->ast.buffer[token];
   int x = 0;
-  if(obj->bytecode[var->token + 1] == '$') {
+  if(var->token[0] == '$') {
     varstack = (struct varstack_t *)obj->userdata;
     for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
       x = alignedbytes(x);
       switch(varstack->stack[x]) {
         case VINTEGER: {
           struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-          if(strcmp((char *)&obj->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = foo->value;
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+          if(strcmp((char *)foo->token, (char *)&var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = obj->valstack.buffer[foo->value];
             val->ret = token;
-            foo->value = 0;
+            obj->valstack.buffer[foo->value] = 0;
             return;
           }
           x += sizeof(struct vm_vinteger_t)-1;
         } break;
         case VFLOAT: {
           struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->bytecode[val->ret];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
 
-          if(strcmp((char *)&obj->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = foo->value;
+          if(strcmp((char *)foo->token, (char *)var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = obj->valstack.buffer[foo->value];
             val->ret = token;
-            foo->value = 0;
+            obj->valstack.buffer[foo->value] = 0;
             return;
           }
           x += sizeof(struct vm_vfloat_t)-1;
         } break;
         case VNULL: {
           struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-          if(strcmp((char *)&obj->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = foo->value;
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+          if(strcmp((char *)foo->token, (char *)&var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = obj->valstack.buffer[foo->value];
             val->ret = token;
-            foo->value = 0;
+            obj->valstack.buffer[foo->value] = 0;
             return;
           }
           x += sizeof(struct vm_vnull_t)-1;
@@ -277,7 +305,7 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
         } break;
       }
     }
-  } else if(obj->bytecode[var->token + 1] == '#') {
+  } else if(var->token[0] == '#') {
 
     varstack = &global_varstack;
     // for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
@@ -295,7 +323,7 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
           // struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
           // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
           // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-          
+
           // x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
         // } break;
         // case VNULL: {
@@ -314,47 +342,42 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
 
     for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
       x = alignedbytes(x);
-      
       switch(varstack->stack[x]) {
         case VINTEGER: {
-          struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vinteger_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvinteger_t *val = (struct vm_gvinteger_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = x;
+          if(strcmp((char *)foo->token, (char *)var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = x;
             val->ret = token;
-            memcpy((char *)&varstack->stack[x+sizeof(struct vm_vinteger_t)], (void *)&obj->nr, sizeof(int));
-
+            val->rule = obj->nr;
             return;
           }
-          x += sizeof(struct vm_vinteger_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvinteger_t)-1;
         } break;
         case VFLOAT: {
-          struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvfloat_t *val = (struct vm_gvfloat_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = x;
+          if(strcmp((char *)foo->token, (char *)var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = x;
             val->ret = token;
-            memcpy((char *)&varstack->stack[x+sizeof(struct vm_vfloat_t)], (void *)&obj->nr, sizeof(int));
+            val->rule = obj->nr;
             return;
           }
-          x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvfloat_t)-1;
         } break;
         case VNULL: {
-          struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vnull_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvnull_t *val = (struct vm_gvnull_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0 && val->ret != token) {
-            var->value = x;
+          if(strcmp((char *)foo->token, (char *)var->token) == 0 && val->ret != token) {
+            obj->valstack.buffer[var->value] = x;
             val->ret = token;
-            memcpy((char *)&varstack->stack[x+sizeof(struct vm_vnull_t)], (void *)&obj->nr, sizeof(int));
+            val->rule = obj->nr;
             return;
           }
-          x += sizeof(struct vm_vnull_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvnull_t)-1;
         } break;
         default: {
           printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -366,61 +389,115 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
 }
 
 static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
-  struct varstack_t *varstack = NULL;
-  struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[token];
+  struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[token];
   int i = 0;
-  if(obj->bytecode[node->token + 1] == '$') {
-    varstack = (struct varstack_t *)obj->userdata;
-  } else if(obj->bytecode[node->token + 1] == '#') {
-    varstack = &global_varstack;
-  }
-  if(varstack != NULL) {
-    if(node->value == 0) {
+  if(node->token[0] == '$') {
+    struct varstack_t *varstack = (struct varstack_t *)obj->userdata;
+    if(obj->valstack.buffer[node->value] == 0) {
       int ret = varstack->nrbytes, suffix = 0;
-      if(varstack == &global_varstack) {
-        suffix = sizeof(int);
-      }
-      if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes)+sizeof(struct vm_vnull_t)+suffix)) == NULL) {
+
+      // printf(".. %s %d %d\n", __FUNCTION__, __LINE__, ret);
+      unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_vnull_t));
+      if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
       struct vm_vnull_t *value = (struct vm_vnull_t *)&varstack->stack[ret];
       value->type = VNULL;
       value->ret = token;
-      node->value = ret;
+      obj->valstack.buffer[node->value] = ret;
 
-      if(varstack == &global_varstack) {
-        memcpy((char *)&varstack->stack[alignedbytes(varstack->nrbytes)+sizeof(struct vm_vnull_t)], (void *)&obj->nr, sizeof(int));
-      }
-
-      varstack->nrbytes = alignedbytes(varstack->nrbytes) + sizeof(struct vm_vnull_t) + suffix;
+      varstack->nrbytes = size;
     }
 
-    const char *key = (char *)&obj->bytecode[node->token+1];
-    switch(varstack->stack[node->value]) {
+
+    const char *key = (char *)node->token;
+    switch(varstack->stack[obj->valstack.buffer[node->value]]) {
       case VINTEGER: {
-        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&varstack->stack[node->value];
-        printf("%s %s = %d\n", __FUNCTION__, key, (int)na->value);
+        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+        printf(".. %s %d %s = %d\n", __FUNCTION__, node->value, key, (int)na->value);
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&varstack->stack[node->value];
-        printf("%s %s = %g\n", __FUNCTION__, key, na->value);
+        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+        printf(".. %s %d %s = %g\n", __FUNCTION__, node->value, key, na->value);
       } break;
       case VNULL: {
-        struct vm_vnull_t *na = (struct vm_vnull_t *)&varstack->stack[node->value];
-        printf("%s %s = NULL\n", __FUNCTION__, key);
+        struct vm_vnull_t *na = (struct vm_vnull_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+        printf(".. %s %d %s = NULL\n", __FUNCTION__, node->value, key);
       } break;
       case VCHAR: {
-        struct vm_vchar_t *na = (struct vm_vchar_t *)&varstack->stack[node->value];
-        printf("%s %s = %s\n", __FUNCTION__, key, na->value);
+        struct vm_vchar_t *na = (struct vm_vchar_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+        printf(".. %s %d %s = %s\n", __FUNCTION__, node->value, key, na->value);
       } break;
     }
 
-    return &varstack->stack[node->value];
+    return &varstack->stack[obj->valstack.buffer[node->value]];
+
+  }
+  if(node->token[0] == '#') {
+    struct varstack_t *varstack = &global_varstack;
+    if(obj->valstack.buffer[node->value] == 0) {
+      int ret = varstack->nrbytes, suffix = 0;
+
+      // printf(".. %s %d %d\n", __FUNCTION__, __LINE__, ret);
+      unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_gvnull_t));
+      if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
+        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      }
+      struct vm_gvnull_t *value = (struct vm_gvnull_t *)&varstack->stack[ret];
+      value->type = VNULL;
+      value->ret = token;
+      value->rule = obj->nr;
+      obj->valstack.buffer[node->value] = ret;
+
+      varstack->nrbytes = size;
+    }
+
+
+    const char *key = (char *)node->token;
+    switch(varstack->stack[obj->valstack.buffer[node->value]]) {
+      case VINTEGER: {
+        struct vm_gvinteger_t *na = (struct vm_gvinteger_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+
+        memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
+        vinteger.type = VINTEGER;
+        vinteger.value = (int)na->value;
+
+        printf(".. %s %d %s = %d\n", __FUNCTION__, node->value, key, (int)na->value);
+
+        return (unsigned char *)&vinteger;
+      } break;
+      case VFLOAT: {
+        struct vm_gvfloat_t *na = (struct vm_gvfloat_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+
+        memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+        vfloat.type = VFLOAT;
+        vfloat.value = na->value;
+
+        printf(".. %s %d %s = %g\n", __FUNCTION__, node->value, key, na->value);
+
+        return (unsigned char *)&vfloat;
+      } break;
+      case VNULL: {
+        struct vm_gvnull_t *na = (struct vm_gvnull_t *)&varstack->stack[obj->valstack.buffer[node->value]];
+
+        memset(&vnull, 0, sizeof(struct vm_vnull_t));
+        vnull.type = VNULL;
+
+        printf(".. %s %d %s = NULL\n", __FUNCTION__, node->value, key);
+
+        return (unsigned char *)&vnull;
+      } break;
+      case VCHAR: {
+        exit(-1);
+      } break;
+    }
+
+    exit(-1);
   }
 
-  if(obj->bytecode[node->token + 1] == '@') {
+  if(node->token[0] == '@') {
     for(i=0;i<NUMBER_OF_TOPICS;i++) {
-      if(stricmp(topics[i], (char *)&obj->bytecode[node->token + 2]) == 0) {
+      if(stricmp(topics[i], (char *)&node->token[1]) == 0) {
         float var = atof(hp_values[i]);
         float nr = 0;
 
@@ -429,27 +506,36 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
           memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
           vinteger.type = VINTEGER;
           vinteger.value = (int)var;
-          printf("%s %s = %d\n", __FUNCTION__, (char *)&obj->bytecode[node->token + 1], (int)var);
+          printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)var);
           return (unsigned char *)&vinteger;
         } else {
           memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
           vfloat.type = VFLOAT;
           vfloat.value = var;
-          printf("%s %s = %g\n", __FUNCTION__, (char *)&obj->bytecode[node->token + 1], var);
+          printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
           return (unsigned char *)&vfloat;
         }
       }
     }
   }
-  if(obj->bytecode[node->token + 1] == '%') {
-    if(stricmp((char *)&obj->bytecode[node->token + 2], "hour") == 0) {
+  if(node->token[0] == '%') {
+    if(stricmp((char *)&node->token[1], "hour") == 0) {
       time_t now = time(NULL);
       struct tm *tm_struct = localtime(&now);
 
       memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
       vinteger.type = VINTEGER;
       vinteger.value = (int)tm_struct->tm_hour;
-      printf("%s %s = %d\n", __FUNCTION__, (char *)&obj->bytecode[node->token + 1], (int)tm_struct->tm_hour);
+      printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)tm_struct->tm_hour);
+      return (unsigned char *)&vinteger;
+    } else if(stricmp((char *)&node->token[1], "month") == 0) {
+      time_t now = time(NULL);
+      struct tm *tm_struct = localtime(&now);
+
+      memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
+      vinteger.type = VINTEGER;
+      vinteger.value = (int)tm_struct->tm_mon + 1;
+      printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)tm_struct->tm_mon + 1);
       return (unsigned char *)&vinteger;
     }
   }
@@ -462,9 +548,10 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
 
   if(idx == varstack->nrbytes) {
     return -1;
-  }  switch(varstack->stack[idx]) {
+  }
+  switch(varstack->stack[idx]) {
     case VINTEGER: {
-      ret = sizeof(struct vm_vinteger_t);
+      ret = alignedbytes(sizeof(struct vm_vinteger_t));
       memmove(&varstack->stack[idx], &varstack->stack[idx+ret], varstack->nrbytes-idx-ret);
       if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -472,7 +559,7 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
       varstack->nrbytes -= ret;
     } break;
     case VFLOAT: {
-      ret = sizeof(struct vm_vfloat_t);
+      ret = alignedbytes(sizeof(struct vm_vfloat_t));
       memmove(&varstack->stack[idx], &varstack->stack[idx+ret], varstack->nrbytes-idx-ret);
       if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -480,7 +567,7 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
       varstack->nrbytes -= ret;
     } break;
     case VNULL: {
-      ret = sizeof(struct vm_vnull_t);
+      ret = alignedbytes(sizeof(struct vm_vnull_t));
       memmove(&varstack->stack[idx], &varstack->stack[idx+ret], varstack->nrbytes-idx-ret);
       if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -505,16 +592,16 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
       case VINTEGER: {
         struct vm_vinteger_t *node = (struct vm_vinteger_t *)&varstack->stack[x];
         if(node->ret > 0) {
-          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[node->ret];
-          tmp->value = x;
+          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[node->ret];
+          obj->valstack.buffer[tmp->value] = x;
         }
         x += sizeof(struct vm_vinteger_t)-1;
       } break;
       case VFLOAT: {
         struct vm_vfloat_t *node = (struct vm_vfloat_t *)&varstack->stack[x];
         if(node->ret > 0) {
-          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[node->ret];
-          tmp->value = x;
+          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[node->ret];
+          obj->valstack.buffer[tmp->value] = x;
         }
         x += sizeof(struct vm_vfloat_t)-1;
       } break;
@@ -530,27 +617,29 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
 
 static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
   struct varstack_t *varstack = NULL;
-  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->bytecode[token];
-  int ret = 0, x = 0, loop = 1;  if(obj->bytecode[var->token + 1] == '$') {
+  struct vm_tvar_t *var = (struct vm_tvar_t *)&obj->ast.buffer[token];
+  int ret = 0, x = 0, loop = 1;
+
+  if(var->token[0] == '$') {
     varstack = (struct varstack_t *)obj->userdata;
 
-    const char *key = (char *)&obj->bytecode[var->token+1];
-    switch(obj->bytecode[val]) {
+    const char *key = (char *)var->token;
+    switch(obj->varstack.buffer[val]) {
       case VINTEGER: {
-        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->bytecode[val];
-        printf("%s %s = %d\n", __FUNCTION__, key, (int)na->value);
+        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %d\n", __FUNCTION__, val, key, (int)na->value);
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->bytecode[val];
-        printf("%s %s = %g\n", __FUNCTION__, key, na->value);
+        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %g\n", __FUNCTION__, val, key, na->value);
       } break;
       case VNULL: {
-        struct vm_vnull_t *na = (struct vm_vnull_t *)&obj->bytecode[val];
-        printf("%s %s = NULL\n", __FUNCTION__, key);
+        struct vm_vnull_t *na = (struct vm_vnull_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = NULL\n", __FUNCTION__, val, key);
       } break;
       case VCHAR: {
-        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->bytecode[val];
-        printf("%s %s = %s\n", __FUNCTION__, key, na->value);
+        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %s\n", __FUNCTION__, val, key, na->value);
       } break;
     }
 
@@ -563,9 +652,9 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
       switch(varstack->stack[x]) {
         case VINTEGER: {
           struct vm_vinteger_t *node = (struct vm_vinteger_t *)&varstack->stack[x];
-          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[node->ret];
-          if(strcmp((char *)&obj->bytecode[var->token+1], (char *)&obj->bytecode[tmp->token+1]) == 0) {
-            var->value = 0;
+          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[node->ret];
+          if(strcmp((char *)var->token, (char *)tmp->token) == 0) {
+            obj->valstack.buffer[var->value] = 0;
             vm_value_del(obj, x);
             loop = 0;
             break;
@@ -574,9 +663,9 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
         } break;
         case VFLOAT: {
           struct vm_vfloat_t *node = (struct vm_vfloat_t *)&varstack->stack[x];
-          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[node->ret];
-          if(strcmp((char *)&obj->bytecode[var->token+1], (char *)&obj->bytecode[tmp->token+1]) == 0) {
-            var->value = 0;
+          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[node->ret];
+          if(strcmp((char *)var->token, (char *)tmp->token) == 0) {
+            obj->valstack.buffer[var->value] = 0;
             vm_value_del(obj, x);
             loop = 0;
             break;
@@ -585,9 +674,9 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
         } break;
         case VNULL: {
           struct vm_vnull_t *node = (struct vm_vnull_t *)&varstack->stack[x];
-          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[node->ret];
-          if(strcmp((char *)&obj->bytecode[var->token+1], (char *)&obj->bytecode[tmp->token+1]) == 0) {
-            var->value = 0;
+          struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[node->ret];
+          if(strcmp((char *)var->token, (char *)tmp->token) == 0) {
+            obj->valstack.buffer[var->value] = 0;
             vm_value_del(obj, x);
             loop = 0;
             break;
@@ -601,93 +690,95 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
       }
     }
 
-    var = (struct vm_tvar_t *)&obj->bytecode[token];
-    if(var->value > 0) {
-      vm_value_del(obj, var->value);
+    var = (struct vm_tvar_t *)&obj->ast.buffer[token];
+    if(obj->valstack.buffer[var->value] > 0) {
+      vm_value_del(obj, obj->valstack.buffer[var->value]);
     }
-    var = (struct vm_tvar_t *)&obj->bytecode[token];
+    var = (struct vm_tvar_t *)&obj->ast.buffer[token];
 
     ret = varstack->nrbytes;
 
-    var->value = ret;
+    obj->valstack.buffer[var->value] = ret;
 
-    switch(obj->bytecode[val]) {
+    switch(obj->varstack.buffer[val]) {
       case VINTEGER: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes)+sizeof(struct vm_vinteger_t))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes+sizeof(struct vm_vinteger_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
-        struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&obj->bytecode[val];
+        struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&obj->varstack.buffer[val];
         struct vm_vinteger_t *value = (struct vm_vinteger_t *)&varstack->stack[ret];
         value->type = VINTEGER;
         value->ret = token;
         value->value = (int)cpy->value;
 
-        varstack->nrbytes = alignedbytes(varstack->nrbytes) + sizeof(struct vm_vinteger_t);
+        varstack->nrbytes = size;
       } break;
       case VFLOAT: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes)+sizeof(struct vm_vfloat_t))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes+sizeof(struct vm_vfloat_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
-        struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&obj->bytecode[val];
+        struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&obj->varstack.buffer[val];
         struct vm_vfloat_t *value = (struct vm_vfloat_t *)&varstack->stack[ret];
         value->type = VFLOAT;
         value->ret = token;
         value->value = cpy->value;
 
-        varstack->nrbytes = alignedbytes(varstack->nrbytes) + sizeof(struct vm_vfloat_t);
+        varstack->nrbytes = size;
       } break;
       case VNULL: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes)+sizeof(struct vm_vnull_t))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes+sizeof(struct vm_vnull_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
         struct vm_vnull_t *value = (struct vm_vnull_t *)&varstack->stack[ret];
         value->type = VNULL;
         value->ret = token;
-        varstack->nrbytes = alignedbytes(varstack->nrbytes) + sizeof(struct vm_vnull_t);
+        varstack->nrbytes = size;
       } break;
       default: {
         printf("err: %s %d\n", __FUNCTION__, __LINE__);
         exit(-1);
       } break;
     }
-  } else if(obj->bytecode[var->token + 1] == '#') {
+  } else if(var->token[0] == '#') {
     varstack = &global_varstack;
 
-    const char *key = (char *)&obj->bytecode[var->token+1];
-    switch(obj->bytecode[val]) {
+    const char *key = (char *)var->token;
+    switch(obj->varstack.buffer[val]) {
       case VINTEGER: {
-        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->bytecode[val];
-        printf("%s %s = %d\n", __FUNCTION__, key, (int)na->value);
+        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %d\n", __FUNCTION__, __LINE__, key, (int)na->value);
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->bytecode[val];
-        printf("%s %s = %g\n", __FUNCTION__, key, na->value);
+        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %g\n", __FUNCTION__, __LINE__, key, na->value);
       } break;
       case VCHAR: {
-        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->bytecode[val];
-        printf("%s %s = %s\n", __FUNCTION__, key, na->value);
+        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = %s\n", __FUNCTION__, __LINE__, key, na->value);
       } break;
       case VNULL: {
-        struct vm_vnull_t *na = (struct vm_vnull_t *)&obj->bytecode[val];
-        printf("%s %s = NULL\n", __FUNCTION__, key);
+        struct vm_vnull_t *na = (struct vm_vnull_t *)&obj->varstack.buffer[val];
+        printf(".. %s %d %s = NULL\n", __FUNCTION__, __LINE__, key);
       } break;
     }
 
-    var = (struct vm_tvar_t *)&obj->bytecode[token];
+    var = (struct vm_tvar_t *)&obj->ast.buffer[token];
     int move = 0;
     for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
       x = alignedbytes(x);
-
       switch(varstack->stack[x]) {
         case VINTEGER: {
-          struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vinteger_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvinteger_t *val = (struct vm_gvinteger_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+          // printf(".. %s %d %d %d %d %s = %d\n", __FUNCTION__, __LINE__, x, val->ret, val->rule, foo->token, val->value);
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0) {
+          if(strcmp((char *)foo->token, (char *)var->token) == 0) {
             move = 1;
 
-            ret = sizeof(struct vm_vinteger_t)+sizeof(int);
+            ret = alignedbytes(sizeof(struct vm_gvinteger_t));
             memmove(&varstack->stack[x], &varstack->stack[x+ret], varstack->nrbytes-x-ret);
             if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
               OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -696,14 +787,14 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
           }
         } break;
         case VFLOAT: {
-          struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvfloat_t *val = (struct vm_gvfloat_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+          // printf(".. %s %d %d %d %d %s = %g\n", __FUNCTION__, __LINE__, x, val->ret, val->rule, foo->token, val->value);
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0) {
+          if(strcmp((char *)foo->token, (char *)var->token) == 0) {
             move = 1;
 
-            ret = sizeof(struct vm_vfloat_t)+sizeof(int);
+            ret = alignedbytes(sizeof(struct vm_gvfloat_t));
             memmove(&varstack->stack[x], &varstack->stack[x+ret], varstack->nrbytes-x-ret);
             if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
               OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -712,14 +803,14 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
           }
         } break;
         case VNULL: {
-          struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vnull_t)];
-          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
+          struct vm_gvnull_t *val = (struct vm_gvnull_t *)&varstack->stack[x];
+          struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+          // printf(".. %s %d %d %d %d %s = NULL\n", __FUNCTION__, __LINE__, x, val->ret, val->rule, foo->token);
 
-          if(strcmp((char *)&rules[rule-1]->bytecode[foo->token+1], (char *)&obj->bytecode[var->token+1]) == 0) {
+          if(strcmp((char *)foo->token, (char *)var->token) == 0) {
             move = 1;
 
-            ret = sizeof(struct vm_vnull_t)+sizeof(int);
+            ret = alignedbytes(sizeof(struct vm_gvnull_t));
             memmove(&varstack->stack[x], &varstack->stack[x+ret], varstack->nrbytes-x-ret);
             if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, varstack->nrbytes-ret)) == NULL) {
               OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -732,107 +823,110 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
           exit(-1);
         } break;
       }
+      if(x == varstack->nrbytes) {
+        break;
+      }
 
       switch(varstack->stack[x]) {
         case VINTEGER: {
           if(move == 1 && x < varstack->nrbytes) {
-            struct vm_vinteger_t *node = (struct vm_vinteger_t *)&varstack->stack[x];
+            struct vm_gvinteger_t *node = (struct vm_gvinteger_t *)&varstack->stack[x];
             if(node->ret > 0) {
-              int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vinteger_t)];
-
-              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[rule-1]->bytecode[node->ret];
-              tmp->value = x;
+              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[node->rule-1]->ast.buffer[node->ret];
+              rules[node->rule-1]->valstack.buffer[tmp->value] = x;
             }
           }
-          x += sizeof(struct vm_vinteger_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvinteger_t)-1;
         } break;
         case VFLOAT: {
           if(move == 1 && x < varstack->nrbytes) {
-            struct vm_vfloat_t *node = (struct vm_vfloat_t *)&varstack->stack[x];
+            struct vm_gvfloat_t *node = (struct vm_gvfloat_t *)&varstack->stack[x];
             if(node->ret > 0) {
-              int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
-
-              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[rule-1]->bytecode[node->ret];
-              tmp->value = x;
+              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[node->rule-1]->ast.buffer[node->ret];
+              rules[node->rule-1]->valstack.buffer[tmp->value] = x;
             }
           }
-          x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvfloat_t)-1;
         } break;
         case VNULL: {
           if(move == 1 && x < varstack->nrbytes) {
-            struct vm_vnull_t *node = (struct vm_vnull_t *)&varstack->stack[x];
+            struct vm_gvnull_t *node = (struct vm_gvnull_t *)&varstack->stack[x];
             if(node->ret > 0) {
-              int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vnull_t)];
-
-              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[rule-1]->bytecode[node->ret];
-              tmp->value = x;
+              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&rules[node->rule-1]->ast.buffer[node->ret];
+              rules[node->rule-1]->valstack.buffer[tmp->value] = x;
             }
           }
-          x += sizeof(struct vm_vnull_t)+sizeof(int)-1;
+          x += sizeof(struct vm_gvnull_t)-1;
         } break;
       }
     }
-    var = (struct vm_tvar_t *)&obj->bytecode[token];
+    var = (struct vm_tvar_t *)&obj->ast.buffer[token];
 
     ret = varstack->nrbytes;
 
-    var->value = ret;
+    obj->valstack.buffer[var->value] = ret;
 
-    switch(obj->bytecode[val]) {
+    switch(obj->varstack.buffer[val]) {
       case VINTEGER: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes+sizeof(struct vm_vinteger_t)+sizeof(int)))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_gvinteger_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
-        struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&obj->bytecode[val];
-        struct vm_vinteger_t *value = (struct vm_vinteger_t *)&varstack->stack[ret];
+        struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&obj->varstack.buffer[val];
+        struct vm_gvinteger_t *value = (struct vm_gvinteger_t *)&varstack->stack[ret];
         value->type = VINTEGER;
         value->ret = token;
         value->value = (int)cpy->value;
+        value->rule = obj->nr;
 
-        memcpy((char *)&varstack->stack[ret+sizeof(struct vm_vinteger_t)], (void *)&obj->nr, sizeof(int));
+        printf(".. %s %d %s = %d\n", __FUNCTION__, __LINE__, var->token, cpy->value);
 
-        varstack->nrbytes = alignedbytes(varstack->nrbytes + sizeof(struct vm_vinteger_t) + sizeof(int));
+        varstack->nrbytes = size;
       } break;
       case VFLOAT: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes+sizeof(struct vm_vfloat_t)+sizeof(int)))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_gvfloat_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
-        struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&obj->bytecode[val];
-        struct vm_vfloat_t *value = (struct vm_vfloat_t *)&varstack->stack[ret];
+        struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&obj->varstack.buffer[val];
+        struct vm_gvfloat_t *value = (struct vm_gvfloat_t *)&varstack->stack[ret];
         value->type = VFLOAT;
         value->ret = token;
         value->value = cpy->value;
+        value->rule = obj->nr;
 
-        memcpy((char *)&varstack->stack[ret+sizeof(struct vm_vfloat_t)], (void *)&obj->nr, sizeof(int));
+        printf(".. %s %d %s = %g\n", __FUNCTION__, __LINE__, var->token, cpy->value);
 
-        varstack->nrbytes = alignedbytes(varstack->nrbytes + sizeof(struct vm_vfloat_t) + sizeof(int));
+        varstack->nrbytes = size;
       } break;
       case VNULL: {
-        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, alignedbytes(varstack->nrbytes+sizeof(struct vm_vnull_t)+sizeof(int)))) == NULL) {
+        unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_gvnull_t));
+        if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
           OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
         }
-        struct vm_vnull_t *value = (struct vm_vnull_t *)&varstack->stack[ret];
+        struct vm_gvnull_t *value = (struct vm_gvnull_t *)&varstack->stack[ret];
         value->type = VNULL;
         value->ret = token;
+        value->rule = obj->nr;
 
-        memcpy((char *)&varstack->stack[ret+sizeof(struct vm_vnull_t)], (void *)&obj->nr, sizeof(int));
+        printf(".. %s %d %s = NULL\n", __FUNCTION__, __LINE__, var->token);
 
-        varstack->nrbytes = alignedbytes(varstack->nrbytes + sizeof(struct vm_vnull_t) + sizeof(int));
+        varstack->nrbytes = size;
       } break;
       default: {
         printf("err: %s %d\n", __FUNCTION__, __LINE__);
         exit(-1);
       } break;
     }
-  } else if(obj->bytecode[var->token + 1] == '@') {
+  } else if(var->token[0] == '@') {
     char *topic = NULL, *payload = NULL;
-    const char *key = (char *)&obj->bytecode[var->token+1];
+    const char *key = (char *)var->token;
     int len = 0;
 
-    switch(obj->bytecode[val]) {
+    switch(obj->varstack.buffer[val]) {
       case VINTEGER: {
-        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->bytecode[val];
-        printf("%s %s = %d\n", __FUNCTION__, key, (int)na->value);
+        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[val];
+        printf("%s %d %s = %d\n", __FUNCTION__, val, key, (int)na->value);
 
         len = snprintf(NULL, 0, "%d", (int)na->value);
         if((payload = (char *)MALLOC(len+1)) == NULL) {
@@ -842,8 +936,8 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
 
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->bytecode[val];
-        printf("%s %s = %g\n", __FUNCTION__, key, na->value);
+        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->varstack.buffer[val];
+        printf("%s %d %s = %g\n", __FUNCTION__, val, key, na->value);
 
         len = snprintf(NULL, 0, "%g", (float)na->value);
         if((payload = (char *)MALLOC(len+1)) == NULL) {
@@ -852,8 +946,8 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
         snprintf(payload, len+1, "%g", (float)na->value);
       } break;
       case VCHAR: {
-        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->bytecode[val];
-        printf("%s %s = %s\n", __FUNCTION__, key, na->value);
+        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->varstack.buffer[val];
+        printf("%s %d %s = %s\n", __FUNCTION__, val, key, na->value);
 
         len = snprintf(NULL, 0, "%s", na->value);
         if((payload = (char *)MALLOC(len+1)) == NULL) {
@@ -863,11 +957,11 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
       } break;
     }
 
-    len = snprintf(NULL, 0, "panasonic_heat_pump/commands/%s", &obj->bytecode[var->token + 2]);
+    len = snprintf(NULL, 0, "panasonic_heat_pump/commands/%s", &var->token[1]);
     if((topic = (char *)MALLOC(len+1)) == NULL) {
       OUT_OF_MEMORY
     }
-    snprintf(topic, len+1, "panasonic_heat_pump/commands/%s", &obj->bytecode[var->token + 2]);
+    snprintf(topic, len+1, "panasonic_heat_pump/commands/%s", &var->token[1]);
 
     mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
     FREE(topic);
@@ -885,13 +979,13 @@ static void vm_value_prt(struct rules_t *obj, char *out, int size) {
       switch(varstack->stack[x]) {
         case VINTEGER: {
           struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          switch(obj->bytecode[val->ret]) {
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %d\n", &obj->bytecode[node->token+1], val->value);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %d\n", node->token, val->value);
             } break;
             default: {
-              // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->bytecode[val->ret]);
+              // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->ast.buffer[val->ret]);
               // exit(-1);
             } break;
           }
@@ -899,10 +993,10 @@ static void vm_value_prt(struct rules_t *obj, char *out, int size) {
         } break;
         case VFLOAT: {
           struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          switch(obj->bytecode[val->ret]) {
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %g\n", &obj->bytecode[node->token+1], val->value);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %g\n", node->token, val->value);
             } break;
             default: {
               // printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -913,10 +1007,10 @@ static void vm_value_prt(struct rules_t *obj, char *out, int size) {
         } break;
         case VNULL: {
           struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          switch(obj->bytecode[val->ret]) {
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = NYLL\n", &obj->bytecode[node->token+1]);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = NULL\n", node->token);
             } break;
             default: {
               // printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -939,74 +1033,63 @@ static void vm_global_value_prt(char *out, int size) {
   int x = 0, pos = 0;
 
   for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
-    if(alignedbytes(x) < varstack->nrbytes) {
-      x = alignedbytes(x);
-      switch(varstack->stack[x]) {
-        case VINTEGER: {
-          struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vinteger_t)];
-          switch(rules[rule-1]->bytecode[val->ret]) {
-            case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %d\n", &rules[rule-1]->bytecode[node->token+1], val->value);
-            } break;
-            default: {
-              // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->bytecode[val->ret]);
-              // exit(-1);
-            } break;
-          }
-          x += sizeof(struct vm_vinteger_t)+sizeof(int)-1;
-        } break;
-        case VFLOAT: {
-          struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
-          switch(rules[rule-1]->bytecode[val->ret]) {
-            case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %g\n", &rules[rule-1]->bytecode[node->token+1], val->value);
-            } break;
-            default: {
-              // printf("err: %s %d\n", __FUNCTION__, __LINE__);
-              // exit(-1);
-            } break;
-          }
-          x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
-        } break;
-        case VNULL: {
-          struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vnull_t)];
-          switch(rules[rule-1]->bytecode[val->ret]) {
-            case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = NULL\n", &rules[rule-1]->bytecode[node->token+1]);
-            } break;
-            default: {
-              // printf("err: %s %d\n", __FUNCTION__, __LINE__);
-              // exit(-1);
-            } break;
-          }
-          x += sizeof(struct vm_vnull_t)+sizeof(int)-1;
-        } break;
-        default: {
-          printf("err: %s %d\n", __FUNCTION__, __LINE__);
-          exit(-1);
-        } break;
-      }
+    x = alignedbytes(x);
+    switch(varstack->stack[x]) {
+      case VINTEGER: {
+        struct vm_gvinteger_t *val = (struct vm_gvinteger_t *)&varstack->stack[x];
+        switch(rules[val->rule-1]->ast.buffer[val->ret]) {
+          case TVAR: {
+            struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+            pos += snprintf(&out[pos], size - pos, "%d %s = %d\n", x, node->token, val->value);
+          } break;
+          default: {
+            // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->ast.buffer[val->ret]);
+            // exit(-1);
+          } break;
+        }
+        x += sizeof(struct vm_gvinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        struct vm_gvfloat_t *val = (struct vm_gvfloat_t *)&varstack->stack[x];
+        switch(rules[val->rule-1]->ast.buffer[val->ret]) {
+          case TVAR: {
+            struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+            pos += snprintf(&out[pos], size - pos, "%d %s = %g\n", x, node->token, val->value);
+          } break;
+          default: {
+            // printf("err: %s %d\n", __FUNCTION__, __LINE__);
+            // exit(-1);
+          } break;
+        }
+        x += sizeof(struct vm_gvfloat_t)-1;
+      } break;
+      case VNULL: {
+        struct vm_gvnull_t *val = (struct vm_gvnull_t *)&varstack->stack[x];
+        switch(rules[val->rule-1]->ast.buffer[val->ret]) {
+          case TVAR: {
+            struct vm_tvar_t *node = (struct vm_tvar_t *)&rules[val->rule-1]->ast.buffer[val->ret];
+            pos += snprintf(&out[pos], size - pos, "%d %s = NULL\n", x, node->token);
+          } break;
+          default: {
+            // printf("err: %s %d\n", __FUNCTION__, __LINE__);
+            // exit(-1);
+          } break;
+        }
+        x += sizeof(struct vm_gvnull_t)-1;
+      } break;
+      default: {
+        printf("err: %s %d\n", __FUNCTION__, __LINE__);
+        exit(-1);
+      } break;
     }
   }
 }
 
 void vm_clear_values(struct rules_t *obj) {
   int i = 0, x = 0;
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == 0 && obj->bytecode[i+1] == 0) {
-      x = i+2;
-      break;
-    }
-  }
-  for(i=x;alignedbytes(i)<obj->nrbytes;i++) {
+  for(i=x;alignedbytes(i)<obj->ast.nrbytes;i++) {
     i = alignedbytes(i);
-    switch(obj->bytecode[i]) {
+    switch(obj->ast.buffer[i]) {
       case TSTART: {
         i+=sizeof(struct vm_tstart_t)-1;
       } break;
@@ -1020,39 +1103,48 @@ void vm_clear_values(struct rules_t *obj) {
         i+=sizeof(struct vm_tif_t)-1;
       } break;
       case LPAREN: {
-        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[i];
-        node->value = 0;
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
         i+=sizeof(struct vm_lparen_t)-1;
       } break;
       case TFALSE:
       case TTRUE: {
-        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo);
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_ttrue_t)+(sizeof(node->go[0])*node->nrgo)-1;
       } break;
       case TFUNCTION: {
-        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[i];
-        node->value = 0;
-        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo);
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
+        i+=sizeof(struct vm_tfunction_t)+(sizeof(node->go[0])*node->nrgo)-1;
       } break;
       case TCEVENT: {
-        i+=sizeof(struct vm_tcevent_t)-1;
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_tcevent_t)+strlen((char *)node->token);
       } break;
       case TVAR: {
-        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[i];
-        node->value = 0;
-        i+=sizeof(struct vm_tvar_t)-1;
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
+        i+=sizeof(struct vm_tvar_t)+strlen((char *)node->token);
       } break;
       case TEVENT: {
-        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_tevent_t)-1;
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[i];
+        i += sizeof(struct vm_tevent_t)+strlen((char *)node->token);
       } break;
       case TNUMBER: {
-        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_tnumber_t)-1;
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_tnumber_t)+strlen((char *)node->token);
+      } break;
+      case VINTEGER: {
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_vinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_vfloat_t)-1;
       } break;
       case TOPERATOR: {
-        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[i];
-        node->value = 0;
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
         i+=sizeof(struct vm_toperator_t)-1;
       } break;
       default: {
@@ -1082,7 +1174,7 @@ void handle_alarm(int sig){
   local_time = localtime(&current_time);
 
   /* Display the local time */
-  printf("\n_______ %s %s\n", __FUNCTION__, asctime(local_time));
+  printf("\n_______ %s %s ", __FUNCTION__, asctime(local_time));
 
   if((node = timerqueue_pop()) != NULL) {
     nr = node->nr;
@@ -1094,10 +1186,11 @@ void handle_alarm(int sig){
     }
     memset(name, 0, i+2);
     snprintf(name, i+1, "timer=%d", nr);
-
+    printf("%s\n", name);
     if((node = timerqueue_peek()) != NULL) {
       if(node->sec <= 0 && node->usec <= 0) {
-        node->usec = 1;
+        handle_alarm(0);
+        return;
       }
       it_val.it_value.tv_sec = node->sec;
       it_val.it_value.tv_usec = node->usec;
@@ -1106,25 +1199,25 @@ void handle_alarm(int sig){
     }
 
     for(x=0;x<nrrules;x++) {
-      if(rules[x]->bytecode[0] == TEVENT) {
-        if(strnicmp(name, (char *)&rules[x]->bytecode[1], strlen(name)) == 0) {
-          rule_run(rules[x], 0);
-          memset(&out, 0, 1024);
-          printf("\n>>> local variables\n");
-          vm_value_prt(rules[x], (char *)&out, 1024);
-          printf("%s",out);
-          printf("\n>>> global variables\n");
-          memset(&out, 0, 1024);
-          vm_global_value_prt((char *)&out, 1024);
-          printf("%s\n",out);
+      if(get_event(rules[x]) > -1 && strcmp((char *)&rules[x]->ast.buffer[get_event(rules[x])+5], name) == 0) {
+      // if(strnicmp(name, (char *)&rules[x]->ast.buffer[1], strlen(name)) == 0) {
+        rule_run(rules[x], 0);
+        memset(&out, 0, 1024);
+        printf("\n>>> local variables\n");
+        vm_value_prt(rules[x], (char *)&out, 1024);
+        printf("%s",out);
+        printf("\n>>> global variables\n");
+        memset(&out, 0, 1024);
+        vm_global_value_prt((char *)&out, 1024);
+        printf("%s\n",out);
 
-          FREE(name);
-          return;
-        }
+        FREE(name);
+        return;
       }
     }
     FREE(name);
   } else {
+    printf("\n");
     it_val.it_value.tv_sec = 0;
     it_val.it_value.tv_usec = 0;
     it_val.it_interval = it_val.it_value;
@@ -1134,6 +1227,9 @@ void handle_alarm(int sig){
 
 void connect_callback(struct mosquitto *mosq, void *obj, int result) {
 	printf("connect callback, rc=%d\n\n", result);
+
+	mosquitto_subscribe(mosq, NULL, topic, 0);
+	mosquitto_subscribe(mosq, NULL, "woonkamer/temperature/temperature", 0);
 }
 
 void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message) {
@@ -1162,15 +1258,15 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
 
   if(message->retain == 0 && (
         strstr(topic, "panasonic_heat_pump/main") != NULL ||
-        strstr(topic, "woonkamer/temperature/temperature")
+        strstr(topic, "woonkamer/temperature/temperature") != NULL
       )
     ) {
-    // printf("=== %s\n", (char *)&topic[offset+1]);
     for(i=0;i<nrrules;i++) {
-      if(rules[i]->bytecode[0] == TEVENT && rules[i]->bytecode[1] == '@' &&
-        strnicmp((char *)&rules[i]->bytecode[2], (char *)&topic[offset+1], strlen(&topic[offset+1])) == 0) {
+      if(get_event(rules[i]) > -1 && rules[i]->ast.buffer[get_event(rules[i])+5] == '@' &&
+        strnicmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+6], (char *)&topic[offset+1], strlen(&topic[offset+1])) == 0) {
+        printf("\n\n==== %s ====\n\n", (char *)&rules[i]->ast.buffer[get_event(rules[i])+6]);
         printf("\n");
-        printf(">>> rule %d nrbytes: %d\n", i, rules[i]->nrbytes);
+        printf(">>> rule %d nrbytes: %d\n", i, rules[i]->ast.nrbytes);
         printf(">>> global stack nrbytes: %d\n",global_varstack.nrbytes);
         rule_run(rules[i], 0);
         memset(&out, 0, 1024);
@@ -1185,7 +1281,7 @@ void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_
     }
     int x = 0;
     for(i=0;i<nrrules;i++) {
-      x += rules[i]->nrbytes;
+      x += rules[i]->ast.nrbytes;
     }
     printf(">>> total rule bytes: %d\n", x+global_varstack.nrbytes);
   }
@@ -1252,7 +1348,7 @@ int main(int argc, char **argv) {
   varstack->stack = NULL;
   varstack->nrbytes = 4;
 
-  while(rule_initialize(content, &pos, &rules, &nrrules, varstack) == 0) {
+  while(rule_initialize(&content, &rules, &nrrules, varstack) == 0) {
     varstack = (struct varstack_t *)MALLOC(sizeof(struct varstack_t));
     if(varstack == NULL) {
       OUT_OF_MEMORY
@@ -1293,10 +1389,10 @@ int main(int argc, char **argv) {
 
   mosquitto_lib_init();
 
-  if((mosq = mosquitto_new("HeishaDaemon", true, NULL)) == NULL) {
-		OUT_OF_MEMORY
-	}
-  
+  if((mosq = mosquitto_new("HeishaDaemon3", true, NULL)) == NULL) {
+    OUT_OF_MEMORY
+  }
+
   mosquitto_log_callback_set(mosq, mosq_log_callback);
   mosquitto_connect_callback_set(mosq, connect_callback);
   mosquitto_message_callback_set(mosq, message_callback);
@@ -1306,9 +1402,6 @@ int main(int argc, char **argv) {
 		exit(1);
 	}
 
-	mosquitto_subscribe(mosq, NULL, topic, 0);
-	mosquitto_subscribe(mosq, NULL, "woonkamer/temperature/temperature", 0);
-
   int foo = 0;
   while(run){
     int rc = mosquitto_loop(mosq, -1, 1);
@@ -1316,12 +1409,13 @@ int main(int argc, char **argv) {
     if(foo == 0) {
       foo = 1;
       for(i=0;i<nrrules;i++) {
-        if(strcmp((char *)&rules[i]->bytecode[1], "System#Boot") == 0) {
-        printf("\n\n==== SYSTEM#BOOT ====\n\n");
+        if(get_event(rules[i]) > -1 && strcmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+5], "System#Boot") == 0) {
+          printf("\n\n==== SYSTEM#BOOT ====\n\n");
           rule_run(rules[i], 0); 
         }
       }
     }
+
     if(run && rc){
       printf("connection error!\n");
       sleep(1);

@@ -20,22 +20,23 @@
 #include "rules.h"
 
 int event_operator_eq_callback(struct rules_t *obj, int a, int b, int *ret) {
-  *ret = obj->nrbytes;
+  *ret = obj->varstack.nrbytes;
 
-  if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+sizeof(struct vm_vinteger_t))) == NULL) {
+  unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+  if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
     OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
   }
-  struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->bytecode[obj->nrbytes];
+  struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
   out->ret = 0;
   out->type = VINTEGER;
 
   /*
    * Values can only be equal when the type matches
    */
-  if((obj->bytecode[a]) != (obj->bytecode[b])) {
+  if((obj->varstack.buffer[a]) != (obj->varstack.buffer[b])) {
     out->value = 0;
   } else {
-    switch(obj->bytecode[a]) {
+    switch(obj->varstack.buffer[a]) {
       case VNULL: {
         out->value = 1;
 
@@ -46,8 +47,8 @@ int event_operator_eq_callback(struct rules_t *obj, int a, int b, int *ret) {
 /* LCOV_EXCL_STOP*/
       } break;
       case VINTEGER: {
-        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->bytecode[a];
-        struct vm_vinteger_t *nb = (struct vm_vinteger_t *)&obj->bytecode[b];
+        struct vm_vinteger_t *na = (struct vm_vinteger_t *)&obj->varstack.buffer[a];
+        struct vm_vinteger_t *nb = (struct vm_vinteger_t *)&obj->varstack.buffer[b];
         if(na->value == nb->value) {
           out->value = 1;
         } else {
@@ -62,9 +63,9 @@ int event_operator_eq_callback(struct rules_t *obj, int a, int b, int *ret) {
 
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->bytecode[a];
-        struct vm_vfloat_t *nb = (struct vm_vfloat_t *)&obj->bytecode[b];
-        if(abs((float)na->value-(float)nb->value) < EPSILON) {
+        struct vm_vfloat_t *na = (struct vm_vfloat_t *)&obj->varstack.buffer[a];
+        struct vm_vfloat_t *nb = (struct vm_vfloat_t *)&obj->varstack.buffer[b];
+        if(fabs((float)na->value-(float)nb->value) < EPSILON) {
           out->value = 1;
         } else {
           out->value = 0;
@@ -75,8 +76,8 @@ int event_operator_eq_callback(struct rules_t *obj, int a, int b, int *ret) {
        */
       /* LCOV_EXCL_START*/
       case VCHAR: {
-        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->bytecode[a];
-        struct vm_vchar_t *nb = (struct vm_vchar_t *)&obj->bytecode[b];
+        struct vm_vchar_t *na = (struct vm_vchar_t *)&obj->varstack.buffer[a];
+        struct vm_vchar_t *nb = (struct vm_vchar_t *)&obj->varstack.buffer[b];
         if(strcmp((char *)na->value, (char *)nb->value) == 0) {
           out->value = 1;
         } else {
@@ -87,7 +88,8 @@ int event_operator_eq_callback(struct rules_t *obj, int a, int b, int *ret) {
     }
   }
 
-  obj->nrbytes += sizeof(struct vm_vinteger_t);
+  obj->varstack.nrbytes = size;
+  obj->varstack.bufsize = alignedbuffer(size);
 
   return 0;
 }

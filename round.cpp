@@ -30,27 +30,29 @@ int event_function_round_callback(struct rules_t *obj, uint16_t argc, uint16_t *
     return -1;
   }
 
-  *ret = obj->nrbytes;
+  *ret = obj->varstack.nrbytes;
 
-  if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+sizeof(struct vm_vinteger_t))) == NULL) {
+  unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+  if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
     OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
   }
-  struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->bytecode[obj->nrbytes];
+  struct vm_vinteger_t *out = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
   out->ret = 0;
   out->type = VINTEGER;
 
-  switch(obj->bytecode[argv[0]]) {
+  switch(obj->varstack.buffer[argv[0]]) {
     case VINTEGER: {
-      struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->bytecode[argv[0]];
+      struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->varstack.buffer[argv[0]];
       out->value = val->value;
     } break;
     case VFLOAT: {
-      struct vm_vfloat_t *val = (struct vm_vfloat_t *)&obj->bytecode[argv[0]];
+      struct vm_vfloat_t *val = (struct vm_vfloat_t *)&obj->varstack.buffer[argv[0]];
       out->value = (int)val->value;
     } break;
   }
 
-  obj->nrbytes += sizeof(struct vm_vfloat_t);
+  obj->varstack.nrbytes = size;
+  obj->varstack.bufsize = alignedbuffer(size);
 
   return 0;
 }

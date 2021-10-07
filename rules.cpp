@@ -23,11 +23,11 @@
   #include <math.h>
   #include <string.h>
   #include <ctype.h>
-  #include <assert.h>
   #include <stdint.h>
 #else
   #include <Arduino.h>
 #endif
+#include <assert.h>
 
 #include "mem.h"
 #include "rules.h"
@@ -53,8 +53,7 @@ struct vm_cache_t {
   uint16_t step;
   uint16_t start;
   uint16_t end;
-} **vmcache;
-
+} __attribute__((packed)) **vmcache;
 static unsigned int nrcache = 0;
 
 /*LCOV_EXCL_START*/
@@ -64,10 +63,8 @@ static void print_bytecode(struct rules_t *obj);
 #endif
 /*LCOV_EXCL_STOP*/
 
-static int lexer_peek(struct rules_t *obj, int skip, int *type);
-
 static int strnicmp(char const *a, char const *b, size_t len) {
-  int i = 0;
+  unsigned int i = 0;
 
   if(a == NULL || b == NULL) {
     return -1;
@@ -85,40 +82,38 @@ static int strnicmp(char const *a, char const *b, size_t len) {
   return -1;
 }
 
-void rules_gc(struct rules_t ***rules, int nrrules) {
-  int i = 0;
+void rules_gc(struct rules_t ***rules, unsigned int nrrules) {
+  unsigned int i = 0;
   for(i=0;i<nrrules;i++) {
-    FREE((*rules)[i]->bytecode);
+    FREE((*rules)[i]->ast.buffer);
+    FREE((*rules)[i]->varstack.buffer);
+    FREE((*rules)[i]->valstack.buffer);
     FREE((*rules)[i]);
   }
   FREE((*rules));
   (*rules) = NULL;
 
 #ifndef ESP8266
+  /*
+   * Should never happen
+   */
+  /* LCOV_EXCL_START*/
   for(i=0;i<nrcache;i++) {
     FREE(vmcache[i]);
     vmcache[i] = NULL;
   }
+  /* LCOV_EXCL_STOP*/
   FREE(vmcache);
   vmcache = NULL;
   nrcache = 0;
 #endif
 }
 
-static int alignedbytes(int v) {
-#ifdef ESP8266
-  while((v++ % 4) != 0);
-  return --v;
-#else
-  return v;
-#endif
-}
-
-static int is_function(struct rules_t *obj, const char *text, int *pos, int size) {
-  int i = 0, len = 0;
-  for(i=0;i<nr_event_functions;i++) {
-    len = strlen(event_functions[i].name);
-    if(size == len && strnicmp(&text[*pos], event_functions[i].name, len) == 0) {
+static int is_function(char *text, unsigned int *pos, unsigned int size) {
+  unsigned int i = 0, len = 0;
+  for(i=0;i<nr_rule_functions;i++) {
+    len = strlen(rule_functions[i].name);
+    if(size == len && strnicmp(&text[*pos], rule_functions[i].name, len) == 0) {
       return i;
     }
   }
@@ -126,11 +121,11 @@ static int is_function(struct rules_t *obj, const char *text, int *pos, int size
   return -1;
 }
 
-static int is_operator(struct rules_t *obj, const char *text, int *pos, int size) {
-  int i = 0, len = 0;
-  for(i=0;i<nr_event_operators;i++) {
-    len = strlen(event_operators[i].name);
-    if(size == len && strnicmp(&text[*pos], event_operators[i].name, len) == 0) {
+static int is_operator(char *text, unsigned int *pos, unsigned int size) {
+  unsigned int i = 0, len = 0;
+  for(i=0;i<nr_rule_operators;i++) {
+    len = strlen(rule_operators[i].name);
+    if(size == len && strnicmp(&text[*pos], rule_operators[i].name, len) == 0) {
       return i;
     }
   }
@@ -138,21 +133,9 @@ static int is_operator(struct rules_t *obj, const char *text, int *pos, int size
   return -1;
 }
 
-static int is_variable(struct rules_t *obj, const char *text, int *pos, int size) {
-  int i = 1;
-  if(text[*pos] == '$' || text[*pos] == '_' || text[*pos] == '@') {
-    while(isalpha(text[*pos+i])) {
-      i++;
-    }
-    return i;
-  }
-  return -1;
-}
+static int lexer_parse_number(char *text, int *pos) {
 
-static int lexer_parse_number(struct rules_t *obj, const char *text, int *pos) {
-
-  int i = 0, nrdot = 0, len = strlen(text), start = *pos;
-
+  int i = 0, nrdot = 0, len = strlen(text);
   if(isdigit(text[*pos]) || text[*pos] == '-') {
     /*
      * The dot cannot be the first character
@@ -171,22 +154,14 @@ static int lexer_parse_number(struct rules_t *obj, const char *text, int *pos) {
       (*pos)++;
       i++;
     }
-
-    if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+(*pos - start)+1)) == NULL) {
-      OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-    }
-    memcpy(&obj->bytecode[obj->nrbytes], &text[start], *pos - start);
-    obj->nrbytes += (*pos - start);
-    obj->bytecode[obj->nrbytes++] = 0;
     return 0;
   } else {
     return -1;
   }
 }
 
-static int lexer_parse_string(struct rules_t *obj, const char *text, int *pos) {
-  int len = strlen(text), start = *pos;
-
+static int lexer_parse_string(char *text, unsigned int *pos) {
+  unsigned int len = strlen(&text[*pos]) + *pos;
   while(*pos <= len &&
         text[*pos] != ' ' &&
         text[*pos] != ',' &&
@@ -195,12 +170,6 @@ static int lexer_parse_string(struct rules_t *obj, const char *text, int *pos) {
         text[*pos] != ')') {
     (*pos)++;
   }
-  if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+(*pos - start)+1)) == NULL) {
-    OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-  }
-  memcpy(&obj->bytecode[obj->nrbytes], &text[start], *pos - start);
-  obj->nrbytes += (*pos - start);
-  obj->bytecode[obj->nrbytes++] = 0;
   return 0;
 }
 
@@ -262,7 +231,7 @@ static int lexer_parse_string(struct rules_t *obj, const char *text, int *pos) {
   // return -1;
 // }
 
-static int lexer_parse_skip_characters(const char *text, int len, int *pos) {
+static int lexer_parse_skip_characters(char *text, unsigned int len, unsigned int *pos) {
   while(*pos <= len &&
       (text[*pos] == ' ' ||
       text[*pos] == '\n' ||
@@ -273,12 +242,16 @@ static int lexer_parse_skip_characters(const char *text, int len, int *pos) {
   return 0;
 }
 
-static int rule_prepare(const char *text, int *pos, struct rules_t *obj) {
-  int ret = 0, len = strlen(text);
-  int nrblocks = 0;
-  while(*pos < len) {
-    lexer_parse_skip_characters(text, len, pos);
+static int rule_prepare(char **text, unsigned int *nrbytes, unsigned int (*nrval), unsigned int *len) {
+  unsigned int pos = 0, nrblocks = 0, tpos = 0;
 
+  *nrbytes = sizeof(struct vm_tstart_t);
+#ifdef DEBUG
+  printf("TSTART: %lu\n", sizeof(struct vm_tstart_t));
+#endif
+
+  while(pos < *len) {
+    lexer_parse_skip_characters(*text, *len, &pos);
 
     // if(lexer->current_char[0] == '\'' || lexer->current_char[0] == '"') {
       // ret = lexer_parse_quoted_string(obj, lexer, &tpos);
@@ -291,518 +264,665 @@ static int rule_prepare(const char *text, int *pos, struct rules_t *obj) {
         // exit(-1);
       // }
     // } else
-    if(isdigit(text[*pos]) || (text[*pos] == '-' && *pos < len && isdigit(text[(*pos)+1]))) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+
+    if(isdigit((*text)[pos]) || ((*text)[pos] == '-' && pos < *len && isdigit((*text)[(pos)+1]))) {
+      int newlen = 0;
+      lexer_parse_number(&(*text)[pos], &newlen);
+
+      char tmp = (*text)[pos+newlen];
+      (*text)[pos+newlen] = 0;
+
+      float var = atof((char *)&(*text)[pos]);
+      float nr = 0;
+
+      if(modff(var, &nr) == 0) {
+        /*
+         * This range of integers
+         * take less bytes when stored
+         * as ascii characters.
+         */
+        if(var < 100 && var > -9) {
+#ifdef DEBUG
+          printf("TNUMBER: %lu\n", sizeof(struct vm_tnumber_t)+newlen+1);
+#endif
+          *nrbytes += sizeof(struct vm_tnumber_t)+newlen+1;
+        } else {
+#ifdef DEBUG
+          printf("TNUMBER: %lu\n", sizeof(struct vm_vinteger_t));
+#endif
+          *nrbytes += sizeof(struct vm_vinteger_t);
+        }
+      } else {
+#ifdef DEBUG
+        printf("TNUMBER: %lu\n", sizeof(struct vm_vfloat_t));
+#endif
+        *nrbytes += sizeof(struct vm_vfloat_t);
       }
-      obj->bytecode[obj->nrbytes++] = TNUMBER;
-      ret = lexer_parse_number(obj, text, pos);
-    } else if(strnicmp((char *)&text[*pos], "if", 2) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+
+      if(newlen < 4) {
+        switch(newlen) {
+          case 1: {
+            // printf("TNUMBER1: %d\n", tpos);
+            (*text)[tpos++] = TNUMBER1;
+          } break;
+          case 2: {
+            // printf("TNUMBER2: %d\n", tpos);
+            (*text)[tpos++] = TNUMBER2;
+          } break;
+          case 3: {
+            // printf("TNUMBER3: %d\n", tpos);
+            (*text)[tpos++] = TNUMBER3;
+          } break;
+        }
+        memcpy(&(*text)[tpos], &(*text)[pos], newlen);
+        tpos += newlen;
+      } else {
+
+        if(modff(var, &nr) == 0) {
+          /*
+           * This range of integers
+           * take less bytes when stored
+           * as ascii characters.
+           */
+          // printf("VINTEGER: %d\n", tpos);
+          (*text)[tpos++] = VINTEGER;
+          int x = var;
+          memcpy(&(*text)[tpos], &x, sizeof(int));
+          tpos += sizeof(int);
+        } else {
+          // printf("VFLOAT: %d\n", tpos);
+          (*text)[tpos++] = VFLOAT;
+          memcpy(&(*text)[tpos], &var, sizeof(float));
+          tpos += sizeof(float);
+        }
       }
-      obj->bytecode[obj->nrbytes++] = TIF;
-      (*pos)+=2;
+
+      if(tmp == ' ' || tmp == '\n' || tmp != '\t' || tmp != '\r') {
+        (*text)[pos+newlen] = tmp;
+        pos += newlen;
+      } else {
+        int x = 0;
+        while(tmp != ' ' && tmp != '\n'  && tmp != '\t' && tmp != '\r') {
+          char tmp1 = (*text)[pos+newlen+1];
+          (*text)[pos+newlen+1] = tmp;
+          tmp = tmp1;
+          newlen += 1;
+          x++;
+        }
+
+        if((*text)[pos+newlen] == ' ' || (*text)[pos+newlen] == '\t' ||
+           (*text)[pos+newlen] == '\r' || (*text)[pos+newlen] == '\n') {
+          (*text)[pos+newlen] = tmp;
+        }
+        pos += newlen-x+1;
+      }
+
+
+    } else if(strnicmp((char *)&(*text)[pos], "if", 2) == 0) {
+      *nrbytes += sizeof(struct vm_tif_t);
+      *nrbytes += sizeof(struct vm_ttrue_t);
+#ifdef DEBUG
+      printf("TIF: %lu\n", sizeof(struct vm_tif_t));
+      printf("TTRUE: %lu\n", sizeof(struct vm_ttrue_t));
+#endif
+
+      /*
+       * An additional TTRUE slot
+       */
+      *nrbytes += sizeof(uint16_t);
+#ifdef DEBUG
+      printf("TTRUE: %lu\n", sizeof(uint16_t));
+#endif
+      // printf("TIF: %d\n", tpos);
+      (*text)[tpos++] = TIF;
+
+      pos+=2;
       nrblocks++;
-    } else if(strnicmp(&text[*pos], "on", 2) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+    } else if(strnicmp(&(*text)[pos], "on", 2) == 0) {
+      pos+=2;
+      lexer_parse_skip_characters((*text), *len, &pos);
+      int s = pos;
+      lexer_parse_string((*text), &pos);
+
+      {
+        unsigned int len = pos - s;
+        *nrbytes += sizeof(struct vm_tevent_t)+len+1;
+        *nrbytes += sizeof(struct vm_ttrue_t);
+#ifdef DEBUG
+        printf("TEVENT: %lu\n", sizeof(struct vm_tevent_t)+len+1);
+        printf("TTRUE: %lu\n", sizeof(struct vm_ttrue_t));
+#endif
+        // printf("TEVENT: %d\n", tpos);
+        (*text)[tpos++] = TEVENT;
+        memcpy(&(*text)[tpos], &(*text)[s], len);
+        tpos += len;
+
+        /*
+         * An additional TTRUE slot
+         */
+        *nrbytes += sizeof(uint16_t);
+#ifdef DEBUG
+        printf("TTRUE: %lu\n", sizeof(uint16_t));
+#endif
       }
-      obj->bytecode[obj->nrbytes++] = TEVENT;
-      *pos+=2;
-      lexer_parse_skip_characters(text, len, pos);
-      ret = lexer_parse_string(obj, text, pos);
       nrblocks++;
-    } else if(strnicmp((char *)&text[*pos], "else", 4) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TELSE;
-      (*pos)+=4;
-    } else if(strnicmp((char *)&text[*pos], "then", 4) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TTHEN;
-      (*pos)+=4;
-    } else if(strnicmp((char *)&text[*pos], "end", 3) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TEND;
-      (*pos)+=3;
+    } else if(strnicmp((char *)&(*text)[pos], "else", 4) == 0) {
+      *nrbytes += sizeof(struct vm_ttrue_t);
+#ifdef DEBUG
+      printf("TTRUE: %lu\n", sizeof(struct vm_ttrue_t));
+#endif
+      pos+=4;
+      (*text)[tpos++] = TELSE;
+    } else if(strnicmp((char *)&(*text)[pos], "then", 4) == 0) {
+      pos+=4;
+      // printf("TTHEN: %d\n", tpos);
+      (*text)[tpos++] = TTHEN;
+    } else if(strnicmp((char *)&(*text)[pos], "end", 3) == 0) {
+      pos+=3;
       nrblocks--;
-    } else if(strnicmp((char *)&text[*pos], "NULL", 4) == 0) {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = VNULL;
-      (*pos)+=4;
-    } else if(text[*pos] == ',') {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TCOMMA;
-      (*pos)++;
-    } else if(text[*pos] == '(') {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = LPAREN;
-      (*pos)++;
-    } else if(text[*pos] == ')') {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = RPAREN;
-      (*pos)++;
-    } else if(text[*pos] == '=' && *pos < len && text[(*pos)+1] != '=') {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TASSIGN;
-      (*pos)++;
-    } else if(text[*pos] == ';') {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+1)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      obj->bytecode[obj->nrbytes++] = TSEMICOLON;
-      (*pos)++;
+      // printf("TEND: %d\n", tpos);
+      (*text)[tpos++] = TEND;
+    } else if(strnicmp((char *)&(*text)[pos], "NULL", 4) == 0) {
+      *nrbytes += sizeof(struct vm_vnull_t);
+#ifdef DEBUG
+      printf("VNULL: %lu\n", sizeof(struct vm_vnull_t));
+#endif
+      // printf("VNULL: %d\n", tpos);
+      (*text)[tpos++] = VNULL;
+      pos+=4;
+    } else if((*text)[pos] == ',') {
+      /*
+       * An additional function argument slot
+       */
+      *nrbytes += sizeof(uint16_t);
+#ifdef DEBUG
+      printf("TFUNCTION: %lu\n", sizeof(uint16_t));
+#endif
+      // printf("TCOMMA: %d\n", tpos);
+      (*text)[tpos++] = TCOMMA;
+      pos++;
+    } else if((*text)[pos] == '(') {
+      *nrbytes += sizeof(struct vm_lparen_t);
+      (*nrval)++;
+#ifdef DEBUG
+      printf("LPAREN: %lu\n", sizeof(struct vm_lparen_t));
+#endif
+      // printf("LPAREN: %d\n", tpos);
+      (*text)[tpos++] = LPAREN;
+      pos++;
+    } else if((*text)[pos] == ')') {
+      pos++;
+      // printf("RPAREN: %d\n", tpos);
+      (*text)[tpos++] = RPAREN;
+    } else if((*text)[pos] == '=' && pos < *len && (*text)[(pos)+1] != '=') {
+      pos++;
+      // printf("TASSIGN: %d\n", tpos);
+      (*text)[tpos++] = TASSIGN;
+    } else if((*text)[pos] == ';') {
+      /*
+       * An additional TTRUE slot
+       */
+      *nrbytes += sizeof(uint16_t);
+#ifdef DEBUG
+      printf("TTRUE: %lu\n", sizeof(uint16_t));
+#endif
+      pos++;
+      // printf("TSEMICOLON: %d\n", tpos);
+      (*text)[tpos++] = TSEMICOLON;
     } else {
-      int a = 0;
-      int b = len-(*pos)-1, len1 = 0;
-      for(a=(*pos);a<len;a++) {
-        if(text[a] == ' ' || text[a] == '(' || text[a] == ',') {
-          b = a-(*pos);
+      unsigned int a = 0, b = *len-(pos)-1;
+      int len1 = 0;
+      for(a=(pos);a<*len;a++) {
+        if((*text)[a] == ' ' || (*text)[a] == '(' || (*text)[a] == ',') {
+          b = a-(pos);
           break;
         }
       }
 
-      if((len1 = is_function(obj, text, pos, b)) > -1) {
-        if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+2)) == NULL) {
-          OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-        }
-        obj->bytecode[obj->nrbytes++] = TFUNCTION;
-        obj->bytecode[obj->nrbytes++] = len1;
-        *pos += b;
-      } else if((len1 = is_operator(obj, text, pos, b)) > -1) {
-        if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+2)) == NULL) {
-          OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-        }
-        obj->bytecode[obj->nrbytes++] = TOPERATOR;
-        obj->bytecode[obj->nrbytes++] = len1;
-        *pos += b;
-      } else if(rule_options.is_token_cb != NULL && (len1 = rule_options.is_token_cb(obj, text, pos, b)) > -1) {
-        if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+len1+2)) == NULL) {
-          OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-        }
-        obj->bytecode[obj->nrbytes++] = TVAR;
-        memcpy(&obj->bytecode[obj->nrbytes], &text[*pos], len1);
-        obj->nrbytes += len1;
-        obj->bytecode[obj->nrbytes++] = 0;
-        *pos += len1;
-      } else if(rule_options.is_event_cb != NULL && (len1 = rule_options.is_event_cb(obj, text, pos, b)) > -1) {
-        if((*pos)+b < len && text[(*pos)+b] == '(' && (*pos)+b+1 < len && text[(*pos)+b+1] == ')') {
-          if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+2)) == NULL) {
-            OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      if((len1 = is_function((*text), &pos, b)) > -1) {
+        *nrbytes += sizeof(struct vm_tfunction_t)+sizeof(uint16_t);
+        *nrbytes -= sizeof(struct vm_lparen_t);
+        (*nrval)++;
+#ifdef DEBUG
+        printf("TFUNCTION: %lu\n", sizeof(struct vm_tfunction_t)+sizeof(uint16_t));
+#endif
+
+        // printf("TFUNCTION: %d\n", tpos);
+        (*text)[tpos++] = TFUNCTION;
+        (*text)[tpos++] = len1;
+        pos += b;
+      } else if((len1 = is_operator((*text), &pos, b)) > -1) {
+        *nrbytes += sizeof(struct vm_toperator_t);
+        (*nrval)++;
+#ifdef DEBUG
+        printf("TOPERATOR: %lu\n", sizeof(struct vm_toperator_t));
+#endif
+        pos += b;
+
+        // printf("TOPERATOR: %d\n", tpos);
+        (*text)[tpos++] = TOPERATOR;
+        (*text)[tpos++] = len1;
+      } else if(rule_options.is_token_cb != NULL && (len1 = rule_options.is_token_cb((*text), &pos, b)) > -1) {
+        *nrbytes += sizeof(struct vm_tvar_t)+len1+1;
+        (*nrval)++;
+#ifdef DEBUG
+        printf("TVAR: %lu\n", sizeof(struct vm_tvar_t)+len1+1);
+#endif
+
+        // printf("TVAR: %d\n", tpos);
+        (*text)[tpos++] = TVAR;
+        memcpy(&(*text)[tpos], &(*text)[pos], len1);
+        tpos += len1;
+        pos += len1;
+      } else if(rule_options.is_event_cb != NULL && (len1 = rule_options.is_event_cb((*text), &pos, b)) > -1) {
+        if((pos)+b < *len && (*text)[(pos)+b] == '(' && (pos)+b+1 < *len && (*text)[(pos)+b+1] == ')') {
+          lexer_parse_skip_characters((*text), *len, &pos);
+          int s = pos;
+          lexer_parse_string((*text), &pos);
+
+          {
+            unsigned int len = pos - s;
+
+            *nrbytes += sizeof(struct vm_tcevent_t)+len+1;
+#ifdef DEBUG
+            printf("TCEVENT: %lu\n", sizeof(struct vm_tcevent_t)+len+1);
+#endif
+            // printf("TCEVENT: %d\n", tpos);
+            (*text)[tpos++] = TCEVENT;
+            memcpy(&(*text)[tpos], &(*text)[s], len);
+            tpos += len;
           }
-          obj->bytecode[obj->nrbytes++] = TCEVENT;
-          lexer_parse_skip_characters(text, len, pos);
-          ret = lexer_parse_string(obj, text, pos);
-          *pos += 2;
+          pos += 2;
         } else {
-          if((len - *pos) > 5) {
-            fprintf(stderr, "ERROR: unknown token '%.5s...'\n", &text[*pos]);
+          if((*len - pos) > 5) {
+            fprintf(stderr, "ERROR: unknown token '%.5s...'\n", &(*text)[pos]);
           } else {
-            fprintf(stderr, "ERROR: unknown token '%.5s'\n", &text[*pos]);
+            fprintf(stderr, "ERROR: unknown token '%.5s'\n", &(*text)[pos]);
           }
           return -1;
         }
       } else {
-        if((len - *pos) > 5) {
-          fprintf(stderr, "ERROR: unknown token '%.5s...'\n", &text[*pos]);
+        if((*len - pos) > 5) {
+          fprintf(stderr, "ERROR: unknown token '%.5s...'\n", &(*text)[pos]);
         } else {
-          fprintf(stderr, "ERROR: unknown token '%.5s'\n", &text[*pos]);
+          fprintf(stderr, "ERROR: unknown token '%.5s'\n", &(*text)[pos]);
         }
         return -1;
       }
     }
 
-    lexer_parse_skip_characters(text, len, pos);
-
     if(nrblocks == 0) {
-      break;
-    }
-  }
-
-  if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes+2)) == NULL) {
-    OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-  }
-  obj->bytecode[obj->nrbytes++] = 0;
-  obj->bytecode[obj->nrbytes++] = 0;
-
-  obj->pos.parsed = alignedbytes(obj->nrbytes);
-
+      /*
+       * Remove one go slot because of the root
+       * if or on block
+       */
+      *nrbytes -= sizeof(uint16_t);
+      *nrbytes += sizeof(struct vm_teof_t);
 #ifdef DEBUG
-  printf("last parse byte: %d\n", obj->pos.parsed); /*LCOV_EXCL_LINE*/
+      printf("TEOF: %lu\n", sizeof(struct vm_teof_t));
 #endif
-  return ret;
-}
 
-static int lexer_bytecode_pos(struct rules_t *obj, int skip, int *pos) {
-  int nr = 0, i = 0;
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == TIF || obj->bytecode[i] == TTHEN ||
-       obj->bytecode[i] == TEND || obj->bytecode[i] == TASSIGN ||
-       obj->bytecode[i] == LPAREN || obj->bytecode[i] == RPAREN ||
-       obj->bytecode[i] == TELSE || obj->bytecode[i] == TSEMICOLON ||
-       obj->bytecode[i] == TCOMMA || obj->bytecode[i] == VNULL ||
-       obj->bytecode[i] == TEND) {
-      *pos = i;
-      nr++;
-    } else if(obj->bytecode[i] == TFUNCTION) {
-      *pos = i;
-      i++;
-      nr++;
-    } else if(obj->bytecode[i] == TOPERATOR) {
-      *pos = i;
-      i++;
-      nr++;
-    } else if(obj->bytecode[i] == TVAR ||
-              obj->bytecode[i] == TSTRING ||
-              obj->bytecode[i] == TNUMBER ||
-              obj->bytecode[i] == TCEVENT ||
-              obj->bytecode[i] == TEVENT) {
-      *pos = i;
-      while(obj->bytecode[++i] != 0);
-      nr++;
-    }
-
-    if(skip == nr-1) {
+      // printf("TEOF: %d\n", tpos);
+      (*text)[tpos++] = TEOF;
+      unsigned int oldpos = pos;
+      lexer_parse_skip_characters((*text), *len, &pos);
+      if(*len == pos) {
+        return 0;
+      }
+      memmove(&(*text)[oldpos], &(*text)[pos-1], *len-(pos)+1);
+      (*text)[oldpos] = 0;
+      *len -= (pos-oldpos-1);
+      (*text)[*len] = 0;
+      *len = oldpos;
       return 0;
     }
-  }
-  /*LCOV_EXCL_START*/
-  if(skip > nr) {
-    fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-    return -1;
-  }
-  if(skip == nr) {
-    fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-    return 0;
+
+    lexer_parse_skip_characters((*text), *len, &pos);
   }
 
-  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-  return -1;
-  /*LCOV_EXCL_STOP*/
+  /*
+   * Remove one go slot because of the root
+   * if or on block
+   */
+  *nrbytes -= sizeof(uint16_t);
+  *nrbytes += sizeof(struct vm_teof_t);
+#ifdef DEBUG
+  printf("TEOF: %lu\n", sizeof(struct vm_teof_t));
+#endif
+  // printf("TEOF: %d\n", tpos);
+  (*text)[tpos++] = TEOF;
+  return 0;
 }
 
-static int vm_parent(struct rules_t *obj, int type, int val) {
-  int ret = alignedbytes(obj->nrbytes), size = 0, pos = -1, i = 0;
+static int lexer_peek(char **text, int skip, int *type, int *start, int *len) {
+  int nr = 0, loop = 1, i = 0;
+  while(loop) {
+    *type = (*text)[i];
+    *start = i;
+    *len = 0;
+    switch((*text)[i]) {
+      case VNULL:
+      case TSEMICOLON:
+      case TEND:
+      case TASSIGN:
+      case RPAREN:
+      case TCOMMA:
+      case LPAREN:
+      case TELSE:
+      case TTHEN:
+      case TIF: {
+        i += 1;
+      } break;
+      case TNUMBER1: {
+        *len = 1;
+        i += 2;
+      } break;
+      case TNUMBER2: {
+        *len = 2;
+        i += 3;
+      } break;
+      case TNUMBER3: {
+        *len = 3;
+        i += 4;
+      } break;
+      case VINTEGER: {
+        i += 1+sizeof(int);
+      } break;
+      case VFLOAT: {
+        i += 1+sizeof(float);
+      } break;
+      case TFUNCTION:
+      case TOPERATOR: {
+        i += 2;
+      } break;
+      case TEOF: {
+        i += 1;
+        loop = 0;
+      } break;
+      case TCEVENT:
+      case TEVENT:
+      case TVAR: {
+        i++;
+        while((*text)[i] > 32 && (*text)[i] < 126) {
+          i++;
+        }
+        *len = i - *start - 1;
+      } break;
+      default: {
+        fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+        return -1;
+      } break;
+    }
+    if(skip == nr++) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int vm_parent(char **text, struct rules_t *obj, int type, int start, int len, unsigned int opt) {
+  unsigned int ret = alignedbytes(obj->ast.nrbytes), size = 0, i = 0, valpos = 0;
+
+  switch(type) {
+    case LPAREN:
+    case TOPERATOR:
+    case TFUNCTION:
+    case TVAR: {
+      for(valpos=0;valpos<obj->valstack.bufsize;valpos++) {
+        if(obj->valstack.buffer[valpos] == 0) {
+          obj->valstack.buffer[valpos] = 1;
+          break;
+        }
+      }
+    } break;
+  }
 
   switch(type) {
     case TSTART: {
       size = alignedbytes(ret+sizeof(struct vm_tstart_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tstart_t));
-
-      struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[ret];
+      assert(size <= obj->ast.bufsize);
+      struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[ret];
       node->type = type;
       node->go = 0;
       node->ret = 0;
 
-      obj->nrbytes = size;
-    } break;
-    case TEOF: {
-      size = alignedbytes(ret+sizeof(struct vm_teof_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_teof_t));
-
-      struct vm_teof_t *node = (struct vm_teof_t *)&obj->bytecode[ret];
-      node->type = type;
-
-      obj->nrbytes = size;
+      obj->ast.nrbytes = size;
     } break;
     case TIF: {
       size = alignedbytes(ret+sizeof(struct vm_tif_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tif_t));
-
-      struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[ret];
+      assert(size <= obj->ast.bufsize);
+      struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[ret];
       node->type = type;
       node->ret = 0;
       node->go = 0;
       node->true_ = 0;
       node->false_ = 0;
 
-      obj->nrbytes = size;
+      obj->ast.nrbytes = size;
     } break;
     case LPAREN: {
       size = alignedbytes(ret+sizeof(struct vm_lparen_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_lparen_t));
-
-      struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[ret];
+      assert(size <= obj->ast.bufsize);
+      struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[ret];
       node->type = type;
       node->ret = 0;
       node->go = 0;
-      node->value = 0;
+      node->value = valpos;
 
-      obj->nrbytes = size;
-    } break;
-    /*LCOV_EXCL_START*/
-    case TNUMBER: {
-      size = alignedbytes(ret+sizeof(struct vm_tnumber_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tnumber_t));
-
-      lexer_bytecode_pos(obj, val, &pos);
-
-      struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[ret];
-      node->type = type;
-      node->ret = 0;
-      node->token = pos;
-
-      obj->nrbytes = size;
-    } break;
-    /*LCOV_EXCL_STOP*/
-    case TFALSE:
-    case TTRUE: {
-      size = alignedbytes(ret+sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*val)+1);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*val)+1);
-
-      struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[ret];
-      node->type = type;
-      node->ret = 0;
-      node->nrgo = val;
-      for(i=0;i<val;i++) {
-        node->go[i] = 0;
-      }
-
-      obj->nrbytes = size;
-    } break;
-    case TFUNCTION: {
-      size = alignedbytes(ret+sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*val)+1);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*val)+1);
-
-      struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[ret];
-      node->token = 0;
-      node->type = type;
-      node->ret = 0;
-      node->nrgo = val;
-      for(i=0;i<val;i++) {
-        node->go[i] = 0;
-      }
-      node->value = 0;
-
-      obj->nrbytes = size;
-    } break;
-    case TCEVENT: {
-      size = alignedbytes(ret+sizeof(struct vm_tcevent_t)+(sizeof(uint16_t)*val)+1);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tcevent_t)+(sizeof(uint16_t)*val)+1);
-
-      lexer_bytecode_pos(obj, val, &pos);
-
-      struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->bytecode[ret];
-      node->token = pos;
-      node->type = type;
-      node->ret = 0;
-
-      obj->nrbytes = size;
-    } break;
-    case VNULL: {
-      size = alignedbytes(ret+sizeof(struct vm_vnull_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_vnull_t));
-
-      struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[ret];
-      node->type = type;
-      node->ret = 0;
-
-      obj->nrbytes = size;
-    } break;
-    case TVAR: {
-      size = alignedbytes(ret+sizeof(struct vm_tvar_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tvar_t));
-
-      lexer_bytecode_pos(obj, val, &pos);
-
-      struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[ret];
-      node->type = type;
-      node->ret = 0;
-      node->token = pos;
-      node->go = 0;
-      node->value = 0;
-
-      obj->nrbytes = size;
-    } break;
-    case TEVENT: {
-      size = alignedbytes(ret+sizeof(struct vm_tevent_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-      }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_tevent_t));
-
-      lexer_bytecode_pos(obj, val, &pos);
-
-      struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[ret];
-      node->type = type;
-      node->ret = 0;
-      node->token = pos;
-      node->go = 0;
-
-      obj->nrbytes = size;
+      obj->ast.nrbytes = size;
     } break;
     case TOPERATOR: {
       size = alignedbytes(ret+sizeof(struct vm_toperator_t));
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, size)) == NULL) {
-        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      assert(size <= obj->ast.bufsize);
+      struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[ret];
+      node->type = type;
+      node->ret = 0;
+      node->token = (*text)[start+1];
+      node->left = 0;
+      node->right = 0;
+      node->value = valpos;
+
+      obj->ast.nrbytes = size;
+    } break;
+    case VINTEGER: {
+      size = alignedbytes(obj->ast.nrbytes+sizeof(struct vm_vinteger_t));
+      assert(size <= obj->ast.bufsize);
+
+      struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->ast.buffer[obj->ast.nrbytes];
+      value->type = VINTEGER;
+      value->ret = ret;
+      memcpy(&value->value, &(*text)[start+1], sizeof(int));
+      obj->ast.nrbytes = size;
+    } break;
+    case VFLOAT: {
+      size = alignedbytes(obj->ast.nrbytes+sizeof(struct vm_vfloat_t));
+      assert(size <= obj->ast.bufsize);
+
+      struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->ast.buffer[obj->ast.nrbytes];
+      value->type = VFLOAT;
+      value->ret = ret;
+      memcpy(&value->value, &(*text)[start+1], sizeof(float));
+      obj->ast.nrbytes = size;
+    } break;
+    case TNUMBER1:
+    case TNUMBER2:
+    case TNUMBER3: {
+      char tmp = (*text)[start+1+len];
+      (*text)[start+1+len] = 0;
+      float var = atof((char *)&(*text)[start+1]);
+      float nr = 0;
+
+      if(modff(var, &nr) == 0) {
+        /*
+         * This range of integers
+         * take less bytes when stored
+         * as ascii characters.
+         */
+        if(var < 100 && var > -9) {
+          size = alignedbytes(ret+sizeof(struct vm_tnumber_t)+len+1);
+          assert(size <= obj->ast.bufsize);
+          struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[ret];
+          node->type = TNUMBER;
+          node->ret = 0;
+          memcpy(node->token, &(*text)[start+1], len);
+
+          obj->ast.nrbytes = size;
+        } else {
+          size = alignedbytes(obj->ast.nrbytes+sizeof(struct vm_vinteger_t));
+          assert(size <= obj->ast.bufsize);
+          struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->ast.buffer[obj->ast.nrbytes];
+          value->type = VINTEGER;
+          value->ret = ret;
+          value->value = (int)var;
+          obj->ast.nrbytes = size;
+        }
+      } else {
+        size = alignedbytes(obj->ast.nrbytes + sizeof(struct vm_vfloat_t));
+        assert(size <= obj->ast.bufsize);
+        struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->ast.buffer[obj->ast.nrbytes];
+        value->type = VFLOAT;
+        value->ret = ret;
+        value->value = var;
+        obj->ast.nrbytes = size;
       }
-      memset(&obj->bytecode[ret], 0, sizeof(struct vm_toperator_t));
+      (*text)[start+1+len] = tmp;
+    } break;
+    case TFALSE:
+    case TTRUE: {
+      size = alignedbytes(ret+sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*opt));
+      assert(size <= obj->ast.bufsize);
+      struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[ret];
+      node->type = type;
+      node->ret = 0;
+      node->nrgo = opt;
+      for(i=0;i<opt;i++) {
+        node->go[i] = 0;
+      }
 
-      lexer_bytecode_pos(obj, val, &pos);
+      obj->ast.nrbytes = size;
+    } break;
+    case TFUNCTION: {
+      size = alignedbytes(ret+sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*opt));
+      assert(size <= obj->ast.bufsize);
+      struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[ret];
+      node->token = (*text)[start+1];
+      node->type = type;
+      node->ret = 0;
+      node->nrgo = opt;
+      for(i=0;i<opt;i++) {
+        node->go[i] = 0;
+      }
+      node->value = valpos;
 
-      struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[ret];
+      obj->ast.nrbytes = size;
+    } break;
+    case VNULL: {
+      size = alignedbytes(ret+sizeof(struct vm_vnull_t));
+      assert(size <= obj->ast.bufsize);
+      struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->ast.buffer[ret];
+      node->type = type;
+      node->ret = 0;
+
+      obj->ast.nrbytes = size;
+    } break;
+    case TVAR: {
+      size = alignedbytes(ret+sizeof(struct vm_tvar_t)+len+1);
+      assert(size <= obj->ast.bufsize);
+      struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[ret];
+      node->type = type;
+      node->ret = 0;
+      node->go = 0;
+      node->value = valpos;
+
+      memcpy(node->token, &(*text)[start+1], len);
+
+      obj->ast.nrbytes = size;
+    } break;
+    case TEVENT: {
+      size = alignedbytes(ret+sizeof(struct vm_tevent_t)+len+1);
+      assert(size <= obj->ast.bufsize);
+      struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[ret];
+      node->type = type;
+      node->ret = 0;
+      node->go = 0;
+
+      memcpy(node->token, &(*text)[start+1], len);
+
+      obj->ast.nrbytes = size;
+    } break;
+    case TCEVENT: {
+      size = alignedbytes(ret+sizeof(struct vm_tcevent_t)+len+1);
+      assert(size <= obj->ast.bufsize);
+      struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[ret];
 
       node->type = type;
       node->ret = 0;
-      node->token = pos;
-      node->left = 0;
-      node->right = 0;
-      node->value = 0;
+      /*
+       * memcpy triggers a -Wstringop-overflow here
+       */
+      memcpy(node->token, &(*text)[start+1], len);
 
-      obj->nrbytes = size;
+      obj->ast.nrbytes = size;
+    } break;
+    case TEOF: {
+      size = alignedbytes(ret+sizeof(struct vm_teof_t));
+      assert(size <= obj->ast.bufsize);
+      struct vm_teof_t *node = (struct vm_teof_t *)&obj->ast.buffer[ret];
+      node->type = type;
+
+      obj->ast.nrbytes = size;
+    } break;
+    default: {
+      return -1;
     } break;
   }
+
   return ret;
-}
-
-static int lexer_peek(struct rules_t *obj, int skip, int *type) {
-  int i = 0, nr = 0, tmp = 0;
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == TIF || obj->bytecode[i] == TTHEN ||
-       obj->bytecode[i] == TEND || obj->bytecode[i] == TASSIGN ||
-       obj->bytecode[i] == LPAREN || obj->bytecode[i] == RPAREN ||
-       obj->bytecode[i] == TELSE || obj->bytecode[i] == TSEMICOLON ||
-       obj->bytecode[i] == TCOMMA || obj->bytecode[i] == VNULL ||
-       obj->bytecode[i] == TEND) {
-      tmp = obj->bytecode[i];
-    } else if(obj->bytecode[i] == TOPERATOR) {
-      tmp = obj->bytecode[i];
-      i++;
-    } else if(obj->bytecode[i] == TFUNCTION) {
-      tmp = obj->bytecode[i];
-      i++;
-    } else if(obj->bytecode[i] == TVAR ||
-              obj->bytecode[i] == TNUMBER ||
-              obj->bytecode[i] == TSTRING ||
-              obj->bytecode[i] == TCEVENT ||
-              obj->bytecode[i] == TEVENT) {
-      tmp = obj->bytecode[i];
-      while(obj->bytecode[i] != 0) {
-        i++;
-      }
-    } else {
-      tmp = TEOF;
-    }
-    if(skip == nr++) {
-      *type = tmp;
-      break;
-    }
-  }
-  if(skip > nr) {
-    return -1;
-  }
-  /*LCOV_EXCL_START*/
-  if(skip == nr) {
-    *type = TEOF;
-    fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-    return 0;
-  }
-  /*LCOV_EXCL_STOP*/
-
-  *type = tmp;
-  return 0;
 }
 
 static int vm_rewind2(struct rules_t *obj, int step, int type, int type2) {
   int tmp = step;
   while(1) {
-    if((obj->bytecode[tmp]) == type || (type2 > -1 && (obj->bytecode[tmp]) == type2)) {
+    if((obj->ast.buffer[tmp]) == type || (type2 > -1 && (obj->ast.buffer[tmp]) == type2)) {
       return tmp;
     } else {
-      switch(obj->bytecode[tmp]) {
+      switch(obj->ast.buffer[tmp]) {
         case TSTART: {
           return 0;
         } break;
         case TIF: {
-          struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[tmp];
+          struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
         case TEVENT: {
-          struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[tmp];
+          struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
-        /*
-         * These are never seen and therefor
-         * interfering with code coverage.
-         */
-        /*
-        case TCEVENT: {
-          struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->bytecode[tmp];
-          tmp = node->ret;
-        } break;
-        case TNUMBER: {
-          struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[tmp];
-          tmp = node->ret;
-        } break;
-        case VNULL: {
-          struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[tmp];
-          tmp = node->ret;
-        } break;
-        */
         case LPAREN: {
-          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[tmp];
+          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
         case TFALSE:
         case TTRUE: {
-          struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[tmp];
+          struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
         case TVAR: {
-          struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[tmp];
+          struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
         case TOPERATOR: {
-          struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[tmp];
+          struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[tmp];
           tmp = node->ret;
         } break;
         /* LCOV_EXCL_START*/
+        case TCEVENT:
+        case TNUMBER1:
+        case TNUMBER2:
+        case TNUMBER3:
+        case VINTEGER:
+        case VFLOAT:
+        case VNULL:
         default: {
           fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
           return -1;
@@ -819,7 +939,7 @@ static int vm_rewind(struct rules_t *obj, int step, int type) {
 }
 
 static void vm_cache_add(int type, int step, int start, int end) {
-  if((vmcache = (struct vm_cache_t **)REALLOC(vmcache, sizeof(struct vm_cache_t)*((nrcache)+1))) == NULL) {
+  if((vmcache = (struct vm_cache_t **)REALLOC(vmcache, sizeof(struct vm_cache_t *)*((nrcache)+1))) == NULL) {
     OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
   }
   if((vmcache[nrcache] = (struct vm_cache_t *)MALLOC(sizeof(struct vm_cache_t))) == NULL) {
@@ -829,6 +949,7 @@ static void vm_cache_add(int type, int step, int start, int end) {
   vmcache[nrcache]->step = step;
   vmcache[nrcache]->start = start;
   vmcache[nrcache]->end = end;
+
   nrcache++;
 #ifdef DEBUG
   printf("cache entries: %d\n", nrcache); /*LCOV_EXCL_LINE*/
@@ -836,7 +957,7 @@ static void vm_cache_add(int type, int step, int start, int end) {
 }
 
 static void vm_cache_del(int start) {
-  int x = 0, y = 0;
+  unsigned int x = 0, y = 0;
   for(x=0;x<nrcache;x++) {
     if(vmcache[x]->start == start) {
       /*LCOV_EXCL_START*/
@@ -858,7 +979,7 @@ static void vm_cache_del(int start) {
     FREE(vmcache);
     vmcache = NULL;
   } else {
-    if((vmcache = (struct vm_cache_t **)REALLOC(vmcache, sizeof(struct vm_cache_t)*nrcache)) == NULL) {
+    if((vmcache = (struct vm_cache_t **)REALLOC(vmcache, sizeof(struct vm_cache_t *)*nrcache)) == NULL) {
       OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
     }
   }
@@ -867,39 +988,33 @@ static void vm_cache_del(int start) {
 #endif
 }
 
-static struct vm_cache_t *vm_cache_get(int type, int step, int start) {
-  int x = 0;
+static struct vm_cache_t *vm_cache_get(int type, int start) {
+  unsigned int x = 0;
   for(x=0;x<nrcache;x++) {
-    if(
-      (
-        (type > -1 && vmcache[x]->type == type) || (type == -1)
-      ) && (
-        (start > -1 && vmcache[x]->start == start) || (start == -1)
-      ) && (
-        (step > -1 && vmcache[x]->step == step) || (step == -1)
-      )
-    ) {
+    if(vmcache[x]->type == type && vmcache[x]->start == start) {
       return vmcache[x];
     }
   }
   return NULL;
 }
 
-static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *step_out, int source) {
-  int b = 0, c = 0, step = 0, val = 0, first = 1;
+static int lexer_parse_math_order(char **text, int *length, struct rules_t *obj, int type, int *pos, int *step_out, int offset, int source) {
+  int b = 0, c = 0, step = 0, first = 1, start = 0, len = 0;
 
   while(1) {
     int right = 0;
-    if(lexer_peek(obj, (*pos)+1, &b) < 0 || b != TOPERATOR) {
+
+    if(lexer_peek(text, (*pos), &b, &start, &len) < 0 || b != TOPERATOR) {
       break;
     }
-    step = vm_parent(obj, b, (*pos)+1);
+    step = vm_parent(text, obj, b, start, len, 0);
+    (*pos)++;
 
-    if(lexer_peek(obj, (*pos)+2, &c) == 0) {
+    if(lexer_peek(text, (*pos), &c, &start, &len) >= 0) {
       switch(c) {
         case LPAREN: {
-          int oldpos = (*pos)+2;
-          struct vm_cache_t *x = vm_cache_get(LPAREN, -1, (*pos) + 2);
+          int oldpos = (*pos);
+          struct vm_cache_t *x = vm_cache_get(LPAREN, (*pos));
           /* LCOV_EXCL_START*/
           if(x == NULL) {
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -911,8 +1026,8 @@ static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *
           vm_cache_del(oldpos);
         } break;
         case TFUNCTION: {
-          int oldpos = (*pos)+2;
-          struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, (*pos) + 2);
+          int oldpos = (*pos);
+          struct vm_cache_t *x = vm_cache_get(TFUNCTION, (*pos));
           /* LCOV_EXCL_START*/
           if(x == NULL) {
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -923,116 +1038,110 @@ static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *
           right = x->step;
           vm_cache_del(oldpos);
         } break;
-        case TVAR: {
-          right = vm_parent(obj, c, (*pos)+2);
-          (*pos) += 2;
-        } break;
-        case TNUMBER: {
-          lexer_bytecode_pos(obj, (*pos) + 2, &val);
-          right = val;
-          (*pos) += 2;
-        } break;
-        case VNULL: {
-          right = vm_parent(obj, c, (*pos)+2);
-          (*pos) += 2;
+        case TVAR:
+        case VNULL:
+        case TNUMBER1:
+        case TNUMBER2:
+        case TNUMBER3:
+        case VINTEGER:
+        case VFLOAT: {
+          right = vm_parent(text, obj, c, start, len, 0);
+          (*pos)++;
         } break;
         default: {
-          int val = 0;
-          lexer_bytecode_pos(obj, (*pos)+1, &val);
-          fprintf(stderr, "ERROR: Expected an parenthesis block, function, number or variable at position #%d\n", val+1);
+          fprintf(stderr, "ERROR: Expected a parenthesis block, function, number or variable\n");
           return -1;
         } break;
       }
     }
 
-    if(right > obj->pos.parsed) {
-      struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[right];
-      node->ret = step;
-    }
+    struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[right];
+    node->ret = step;
 
-    struct vm_toperator_t *op2 = (struct vm_toperator_t *)&obj->bytecode[step];
+    struct vm_toperator_t *op2 = (struct vm_toperator_t *)&obj->ast.buffer[step];
     op2->left = *step_out;
     op2->right = right;
 
-    if(*step_out > obj->pos.parsed) {
-      switch(obj->bytecode[*step_out]) {
-        /*
-         * Number are not seperate nodes so
-         * this block is never triggered.
-         */
-        /*
-        case TNUMBER: {
-          struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        */
-        case LPAREN: {
-          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        case TOPERATOR: {
-          struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        case TVAR: {
-          struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        case TFUNCTION: {
-          struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        case VNULL: {
-          struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[*step_out];
-          node->ret = step;
-        } break;
-        /* LCOV_EXCL_START*/
-        default: {
-          fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-          return -1;
-        } break;
-        /* LCOV_EXCL_STOP*/
-      }
+    switch(obj->ast.buffer[*step_out]) {
+      case TNUMBER:
+      case TNUMBER1:
+      case TNUMBER2:
+      case TNUMBER3: {
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case VINTEGER: {
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case VFLOAT: {
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case LPAREN: {
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case TOPERATOR: {
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case TVAR: {
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case TFUNCTION: {
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      case VNULL: {
+        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->ast.buffer[*step_out];
+        node->ret = step;
+      } break;
+      /* LCOV_EXCL_START*/
+      default: {
+        fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+        return -1;
+      } break;
+      /* LCOV_EXCL_STOP*/
     }
 
     struct vm_toperator_t *op1 = NULL;
 
     if(type == LPAREN) {
-      if(first == 1 && *step_out > obj->pos.parsed) {
-        struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[*step_out];
+      if(first == 1/* && *step_out > obj->pos.parsed*/) {
+        struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[*step_out];
         node->ret = step;
       }
     } else if(type == TOPERATOR) {
       if(first == 1) {
-        struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[step];
+        struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[step];
         node->ret = source;
 
         op2->ret = step;
-        if((obj->bytecode[source]) == TIF) {
-          struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[source];
+        if((obj->ast.buffer[source]) == TIF) {
+          struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[source];
           node->go = step;
         }
       }
     }
 
-    if(*step_out > obj->pos.parsed && (obj->bytecode[step]) == TOPERATOR && (obj->bytecode[*step_out]) == TOPERATOR) {
+    if((obj->ast.buffer[step]) == TOPERATOR && (obj->ast.buffer[*step_out]) == TOPERATOR) {
       struct vm_toperator_t *op3 = NULL;
-      op1 = (struct vm_toperator_t *)&obj->bytecode[*step_out];
+      op1 = (struct vm_toperator_t *)&obj->ast.buffer[*step_out];
 
-      int idx1 = obj->bytecode[op1->token+1];
-      int idx2 = obj->bytecode[op2->token+1];
+      int idx1 = op1->token;
+      int idx2 = op2->token;
 
-      int x = event_operators[idx1].precedence;
-      int y = event_operators[idx2].precedence;
-      int a = event_operators[idx2].associativity;
+      int x = rule_operators[idx1].precedence;
+      int y = rule_operators[idx2].precedence;
+      int a = rule_operators[idx2].associativity;
 
       if(y > x || (x == y && a == 2)) {
         if(a == 1) {
           op2->left = op1->right;
-          if(op2->left > obj->pos.parsed) {
-            op3 = (struct vm_toperator_t *)&obj->bytecode[op2->left];
-            op3->ret = step;
-          }
+          op3 = (struct vm_toperator_t *)&obj->ast.buffer[op2->left];
+          op3->ret = step;
           op1->right = step;
           op2->ret = *step_out;
         } else {
@@ -1041,10 +1150,15 @@ static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *
            * as the last factor.
            */
           int tmp = op1->right;
-          if((obj->bytecode[tmp]) != LPAREN && (obj->bytecode[tmp]) != TFUNCTION) {
-            while((obj->bytecode[tmp]) == TOPERATOR) {
-              if((obj->bytecode[((struct vm_toperator_t *)&obj->bytecode[tmp])->right]) == TOPERATOR) {
-                tmp = ((struct vm_toperator_t *)&obj->bytecode[tmp])->right;
+          if((obj->ast.buffer[tmp]) != LPAREN &&
+             (obj->ast.buffer[tmp]) != TFUNCTION &&
+             (obj->ast.buffer[tmp]) != TNUMBER &&
+             (obj->ast.buffer[tmp]) != VFLOAT &&
+             (obj->ast.buffer[tmp]) != VINTEGER &&
+             (obj->ast.buffer[tmp]) != VNULL) {
+            while((obj->ast.buffer[tmp]) == TOPERATOR) {
+              if((obj->ast.buffer[((struct vm_toperator_t *)&obj->ast.buffer[tmp])->right]) == TOPERATOR) {
+                tmp = ((struct vm_toperator_t *)&obj->ast.buffer[tmp])->right;
               } else {
                 break;
               }
@@ -1053,46 +1167,41 @@ static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *
             tmp = *step_out;
           }
 
-          if(tmp > obj->pos.parsed) {
-            op3 = (struct vm_toperator_t *)&obj->bytecode[tmp];
-            int tright = op3->right;
-            op3->right = step;
+          op3 = (struct vm_toperator_t *)&obj->ast.buffer[tmp];
+          int tright = op3->right;
+          op3->right = step;
 
-            if(tright > obj->pos.parsed) {
-              switch((obj->bytecode[tright])) {
-                /*
-                 * Number are not seperate nodes so
-                 * this block is never triggered.
-                 */
-                /*
-                case TNUMBER: {
-                  struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[tright];
-                  node->ret = step;
-                } break;
-                */
-                case TFUNCTION: {
-                  struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[tright];
-                  node->ret = step;
-                } break;
-                case LPAREN: {
-                  struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[tright];
-                  node->ret = step;
-                } break;
-                /* LCOV_EXCL_START*/
-                default: {
-                  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-                  return -1;
-                } break;
-                /* LCOV_EXCL_STOP*/
-              }
-            }
-            op2->left = tright;
-            op2->ret = tmp;
-          } else {
-            op1->right = step;
-            op2->ret = *step_out;
-            op2->left = tmp;
+          switch((obj->ast.buffer[tright])) {
+            case TNUMBER: {
+              struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[*step_out];
+              node->ret = step;
+            } break;
+            case VINTEGER: {
+              struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[*step_out];
+              node->ret = step;
+            } break;
+            case VFLOAT: {
+              struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[*step_out];
+              node->ret = step;
+            } break;
+            case TFUNCTION: {
+              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[tright];
+              node->ret = step;
+            } break;
+            case LPAREN: {
+              struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[tright];
+              node->ret = step;
+            } break;
+            /* LCOV_EXCL_START*/
+            default: {
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+            } break;
+            /* LCOV_EXCL_STOP*/
           }
+
+          op2->left = tright;
+          op2->ret = tmp;
         }
         step = *step_out;
       } else {
@@ -1105,29 +1214,33 @@ static int lexer_parse_math_order(struct rules_t *obj, int type, int *pos, int *
 
     first = 0;
   }
+
   return step;
 }
 
-static int rule_parse(struct rules_t *obj) {
+static int rule_parse(char **text, int *length, struct rules_t *obj) {
   int type = 0, type1 = 0, go = -1, step_out = -1, step = 0, pos = 0;
   int has_paren = -1, has_function = -1, has_if = -1, has_on = -1;
-  int loop = 1, start = 0, r_rewind = -1;
+  int loop = 1, startnode = 0, r_rewind = -1, offset = 0, start = 0, len = 0;
 
   /* LCOV_EXCL_START*/
-  if(lexer_peek(obj, 0, &type) < 0) {
+  if(lexer_peek(text, 0, &type, &start, &len) < 0) {
     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
     return -1;
   }
   /* LCOV_EXCL_STOP*/
 
   if(type != TIF && type != TEVENT) {
-    fprintf(stderr, "ERROR: Expected an 'if' or an 'on' statement at position #1\n");
+    fprintf(stderr, "ERROR: Expected an 'if' or an 'on' statement\n");
     return -1;
   }
 
-  start = vm_parent(obj, TSTART, -1);
+  startnode = vm_parent(text, obj, TSTART, 0, 0, 0);
 
   while(loop) {
+#ifdef ESP8266
+    ESP.wdtFeed();
+#endif
     if(go > -1) {
       switch(go) {
         /* LCOV_EXCL_START*/
@@ -1142,42 +1255,38 @@ static int rule_parse(struct rules_t *obj) {
         /* LCOV_EXCL_STOP*/
         } break;
         case TEVENT: {
-          if(lexer_peek(obj, pos, &type) < 0) {
+          if(lexer_peek(text, pos, &type, &start, &len) < 0) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
             /* LCOV_EXCL_STOP*/
           }
-
-          if((step_out == -1 || (obj->bytecode[step_out]) == TTRUE) && type != TTHEN) {
+          if((step_out == -1 || (obj->ast.buffer[step_out]) == TTRUE) && type != TTHEN) {
             if(type == TEVENT) {
-              step_out = vm_parent(obj, TEVENT, pos);
-              struct vm_tevent_t *a = (struct vm_tevent_t *)&obj->bytecode[step_out];
-
-              if(pos == 0) {
-                struct vm_tstart_t *b = (struct vm_tstart_t *)&obj->bytecode[start];
-                b->go = step_out;
-                a->ret = start;
+              if(offset > 0) {
+                fprintf(stderr, "ERROR: nested 'on' block\n");
+                return -1;
               }
 
+              step_out = vm_parent(text, obj, TEVENT, start, len, 0);
               pos++;
 
-              lexer_peek(obj, pos, &type);
+              if(lexer_peek(text, pos, &type, &start, &len) >= 0 && type == TTHEN) {
+                pos++;
 
-              if(lexer_peek(obj, pos, &type) == 0 && type == TTHEN) {
                 /*
                  * Predict how many go slots we need to
                  * reserve for the TRUE / FALSE nodes.
                  */
                 int y = pos, nrexpressions = 0;
-                while(lexer_peek(obj, y++, &type) == 0) {
+                while(lexer_peek(text, y++, &type, &start, &len) >= 0) {
                   if(type == TEOF) {
                     break;
                   }
                   if(type == TIF) {
-                    struct vm_cache_t *cache = vm_cache_get(TIF, -1, y-1);
+                    struct vm_cache_t *cache = vm_cache_get(TIF, y-1);
                     nrexpressions++;
-                    y = cache->end + 1;
+                    y = cache->end;
                     continue;
                   }
                   if(type == TEND) {
@@ -1189,9 +1298,7 @@ static int rule_parse(struct rules_t *obj) {
                 }
 
                 if(nrexpressions == 0) {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos+1, &val);
-                  fprintf(stderr, "ERROR: On block without body at position #%d\n", val+1);
+                  fprintf(stderr, "ERROR: On block without body\n");
                   return -1;
                 }
 #ifdef DEBUG
@@ -1203,9 +1310,10 @@ static int rule_parse(struct rules_t *obj) {
                  * for the number of operations the
                  * TRUE of FALSE will forward to.
                  */
-                step = vm_parent(obj, TTRUE, nrexpressions);
-                struct vm_ttrue_t *a = (struct vm_ttrue_t *)&obj->bytecode[step];
-                struct vm_tevent_t *b = (struct vm_tevent_t *)&obj->bytecode[step_out];
+                step = vm_parent(text, obj, TTRUE, start, len, nrexpressions);
+
+                struct vm_ttrue_t *a = (struct vm_ttrue_t *)&obj->ast.buffer[step];
+                struct vm_tevent_t *b = (struct vm_tevent_t *)&obj->ast.buffer[step_out];
 
                 b->go = step;
                 a->ret = step_out;
@@ -1213,11 +1321,8 @@ static int rule_parse(struct rules_t *obj) {
                 go = TEVENT;
 
                 step_out = step;
-                pos++;
               } else {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos, &val);
-                fprintf(stderr, "ERROR: Expected a 'then' token at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Expected a 'then' token\n");
                 return -1;
               }
             } else {
@@ -1231,21 +1336,19 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
                 case TFUNCTION: {
-                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, pos);
+                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, pos);
                   /* LCOV_EXCL_START*/
                   if(x == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
                   /* LCOV_EXCL_STOP*/
-                  if(lexer_peek(obj, x->end + 1, &type) == 0) {
+                  if(lexer_peek(text, x->end, &type, &start, &len) >= 0) {
                     switch(type) {
                       case TSEMICOLON: {
-                        pos = x->end + 2;
-
                         int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
-                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->bytecode[x->step];
-                        struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->bytecode[step_out];
+                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->ast.buffer[x->step];
+                        struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->ast.buffer[step_out];
                         f->ret = tmp;
 
                         int i = 0;
@@ -1265,15 +1368,14 @@ static int rule_parse(struct rules_t *obj) {
 
                         go = TEVENT;
                         step_out = tmp;
+                        pos = x->end + 1;
                         vm_cache_del(x->start);
                       } break;
                       case TOPERATOR: {
                         go = type;
                       } break;
                       default: {
-                        int val = 0;
-                        lexer_bytecode_pos(obj, pos+1, &val);
-                        fprintf(stderr, "ERROR: Expected an semicolon or operator at position #%d\n", val+1);
+                        fprintf(stderr, "ERROR: Expected an semicolon or operator\n");
                         return -1;
                       } break;
                     }
@@ -1281,31 +1383,16 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
                 case TIF: {
-                  struct vm_cache_t *cache = vm_cache_get(TIF, -1, pos);
+                  struct vm_cache_t *cache = vm_cache_get(TIF, pos);
                   /* LCOV_EXCL_START*/
                   if(cache == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
                   /* LCOV_EXCL_STOP*/
+
                   step = cache->step;
-
-                  if(lexer_peek(obj, cache->end + 1, &type) < 0) {
-                    /* LCOV_EXCL_START*/
-                    fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-                    return -1;
-                    /* LCOV_EXCL_STOP*/
-                  }
-
-                  struct vm_tif_t *i = (struct vm_tif_t *)&obj->bytecode[step];
-
-                  /*
-                   * Attach IF block to TRUE / FALSE node
-                   */
-                  int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
-
-                  i->ret = step_out;
-                  pos = cache->end + 1;
+                  pos = cache->end;
 
                   /*
                    * After an cached IF block has been linked
@@ -1313,11 +1400,18 @@ static int rule_parse(struct rules_t *obj) {
                    */
                   vm_cache_del(cache->start);
 
-                  switch(obj->bytecode[step_out]) {
+                  struct vm_tif_t *i = (struct vm_tif_t *)&obj->ast.buffer[step];
+
+                  /*
+                   * Attach IF block to TRUE / FALSE node
+                   */
+
+                  i->ret = step_out;
+                  switch(obj->ast.buffer[step_out]) {
                     case TFALSE:
                     case TTRUE: {
                       int x = 0;
-                      struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->bytecode[step_out];
+                      struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->ast.buffer[step_out];
                       /*
                        * Attach the IF block to an empty
                        * TRUE / FALSE go slot.
@@ -1353,21 +1447,39 @@ static int rule_parse(struct rules_t *obj) {
                   go = -1;
 
                   int tmp = vm_rewind(obj, step_out, TEVENT);
+                  /*
+                   * Should never happen
+                   */
+                  /* LCOV_EXCL_START*/
                   if(has_on > 0) {
-                    int val = 0;
-                    lexer_bytecode_pos(obj, has_on, &val);
-                    fprintf(stderr, "ERROR: On block inside if block at position #%d\n", val+1);
+                    fprintf(stderr, "ERROR: On block inside on block\n");
                     return -1;
                   }
+                  /* LCOV_EXCL_START*/
+
                   if(has_on == 0) {
-                    step = vm_parent(obj, TEOF, -1);
+                    struct vm_tstart_t *b = (struct vm_tstart_t *)&obj->ast.buffer[startnode];
+                    struct vm_tif_t *a = (struct vm_tif_t *)&obj->ast.buffer[tmp];
+                    b->go = tmp;
+                    a->ret = startnode;
+
+                    step = vm_parent(text, obj, TEOF, 0, 0, 0);
 #ifdef DEBUG
                     printf("nr steps: %d\n", step);/*LCOV_EXCL_LINE*/
 #endif
                     tmp = vm_rewind(obj, tmp, TSTART);
 
-                    struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[tmp];
+                    struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[tmp];
                     node->ret = step;
+
+                    if(lexer_peek(text, pos, &type, &start, &len) < 0) {
+                      /* LCOV_EXCL_START*/
+                      fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+                      return -1;
+                      /* LCOV_EXCL_STOP*/
+                    }
+
+                    pos++;
                   }
 
                   /*
@@ -1375,7 +1487,6 @@ static int rule_parse(struct rules_t *obj) {
                    */
                   if(has_on == 0) {
                     loop = 0;
-                    obj->pos.vars = obj->nrbytes;
                   }
 
                   pos = 0;
@@ -1388,9 +1499,7 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
                 default: {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos+1, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val);
+                  fprintf(stderr, "ERROR: Unexpected token\n");
                   return -1;
                 } break;
               }
@@ -1403,7 +1512,7 @@ static int rule_parse(struct rules_t *obj) {
           }
         } break;
         case TIF: {
-          if(lexer_peek(obj, pos, &type) < 0) {
+          if(lexer_peek(text, pos, &type, &start, &len) < 0) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
@@ -1413,32 +1522,33 @@ static int rule_parse(struct rules_t *obj) {
           if(
               (
                 step_out == -1 ||
-                (obj->bytecode[step_out]) == TTRUE ||
-                (obj->bytecode[step_out]) == TFALSE
+                (obj->ast.buffer[step_out]) == TTRUE ||
+                (obj->ast.buffer[step_out]) == TFALSE
               ) && (type != TTHEN && type != TELSE)
             ) {
+
             /*
              * Link cached IF blocks together
              */
-            struct vm_cache_t *cache = vm_cache_get(TIF, -1, pos);
+            struct vm_cache_t *cache = vm_cache_get(TIF, pos);
             if(cache != NULL) {
               step = cache->step;
-              if(lexer_peek(obj, cache->end + 1, &type) < 0) {
+
+              if(lexer_peek(text, cache->end, &type, &start, &len) < 0) {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                 return -1;
                 /* LCOV_EXCL_STOP*/
               }
 
-              struct vm_tif_t *i = (struct vm_tif_t *)&obj->bytecode[step];
+              struct vm_tif_t *i = (struct vm_tif_t *)&obj->ast.buffer[step];
 
               /*
                * Attach IF block to TRUE / FALSE node
                */
-              int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
 
               i->ret = step_out;
-              pos = cache->end + 1;
+              pos = cache->end;
 
               /*
                * After an cached IF block has been linked
@@ -1446,11 +1556,11 @@ static int rule_parse(struct rules_t *obj) {
                */
               vm_cache_del(cache->start);
 
-              switch(obj->bytecode[step_out]) {
+              switch(obj->ast.buffer[step_out]) {
                 case TFALSE:
                 case TTRUE: {
                   int x = 0;
-                  struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->bytecode[step_out];
+                  struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->ast.buffer[step_out];
                   /*
                    * Attach the IF block to an empty
                    * TRUE / FALSE go slot.
@@ -1479,43 +1589,35 @@ static int rule_parse(struct rules_t *obj) {
               /*
                * An IF block directly followed by another IF block
                */
-              if(lexer_peek(obj, pos, &type) == 0 && type == TIF) {
+              if(lexer_peek(text, pos, &type, &start, &len) >= 0 && type == TIF) {
                 go = TIF;
                 continue;
               }
             }
 
             if(type == TIF) {
-              step = vm_parent(obj, type, -1);
-              struct vm_tif_t *a = (struct vm_tif_t *)&obj->bytecode[step];
+              step = vm_parent(text, obj, TIF, start, len, 0);
+              struct vm_tif_t *a = (struct vm_tif_t *)&obj->ast.buffer[step];
 
               if(pos == 0) {
-                struct vm_tstart_t *b = (struct vm_tstart_t *)&obj->bytecode[start];
+                struct vm_tstart_t *b = (struct vm_tstart_t *)&obj->ast.buffer[start];
                 b->go = step;
                 a->ret = start;
               }
 
-              /*
-               * If this is a nested IF block,
-               * cache it for linking further on
-               */
-              if(has_if > 0) {
-                vm_cache_add(TIF, step, has_if, -1);
-              }
-
               pos++;
 
-              if(lexer_peek(obj, pos+1, &type) == 0 && type == TOPERATOR) {
+              if(lexer_peek(text, pos+1, &type, &start, &len) >= 0 && type == TOPERATOR) {
                 go = TOPERATOR;
                 step_out = step;
                 continue;
-              } else if(lexer_peek(obj, pos, &type) == 0 && type == LPAREN) {
+              } else if(lexer_peek(text, pos, &type, &start, &len) >= 0 && type == LPAREN) {
                 step_out = step;
 
                 /*
                  * Link cached parenthesis blocks
                  */
-                struct vm_cache_t *cache = vm_cache_get(LPAREN, -1, pos);
+                struct vm_cache_t *cache = vm_cache_get(LPAREN, pos);
                 /* LCOV_EXCL_START*/
                 if(cache == NULL) {
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -1523,18 +1625,19 @@ static int rule_parse(struct rules_t *obj) {
                 }
                 /* LCOV_EXCL_STOP*/
 
-                struct vm_lparen_t *c = (struct vm_lparen_t *)&obj->bytecode[cache->step];
                 /*
                  * If this parenthesis is part of a operator
                  * let the operator handle it.
                  */
-                 // if (1 + 1) == 1 then $a = 3; else $a = 4; end
-                if(lexer_peek(obj, cache->end + 1, &type) < 0) {
+                if(lexer_peek(text, cache->end, &type, &start, &len) < 0) {
                   /* LCOV_EXCL_START*/
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                   return -1;
                   /* LCOV_EXCL_STOP*/
                 }
+
+
+                struct vm_lparen_t *c = (struct vm_lparen_t *)&obj->ast.buffer[cache->step];
                 if(type == TOPERATOR) {
                   go = TOPERATOR;
                   step_out = step;
@@ -1545,53 +1648,32 @@ static int rule_parse(struct rules_t *obj) {
                   a->go = cache->step;
                   c->ret = step;
                 } else {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, cache->end - 1, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val);
+                  fprintf(stderr, "ERROR: Unexpected token\n");
                   return -1;
                 }
 
-                int oldpos = pos;
-                pos = cache->end + 1;
-                vm_cache_del(oldpos);
+                pos = cache->end;
+
+                vm_cache_del(cache->start);
                 continue;
-              } else if(lexer_peek(obj, pos, &type) == 0 && type == TFUNCTION) {
+              } else if(lexer_peek(text, pos, &type, &start, &len) >= 0 && type == TFUNCTION) {
                 step_out = step;
 
                 /*
                  * Link cached parenthesis blocks
                  */
-                struct vm_cache_t *cache = vm_cache_get(TFUNCTION, -1, pos);
-                /* LCOV_EXCL_START*/
-                if(cache == NULL) {
-                  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-                  return -1;
-                }
-                /* LCOV_EXCL_STOP*/
- 
-                /*
-                 * If this function is part of a operator
-                 * let the operator handle it.
-                 */
-                if(lexer_peek(obj, cache->end + 1, &type) == 0 && type == TOPERATOR) {
+                struct vm_cache_t *cache = vm_cache_get(TFUNCTION, pos);
+
+                if(lexer_peek(text, cache->end, &type, &start, &len) >= 0 && type == TOPERATOR) {
                   go = TOPERATOR;
                   step_out = step;
                   continue;
                 } else {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, cache->end, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val);
+                  fprintf(stderr, "ERROR: Function without operator in if condition\n");
                   return -1;
                 }
-
-                int oldpos = pos;
-                pos = cache->end + 1;
-                vm_cache_del(oldpos);
-                continue;
               } else {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos+1, &val);
-                fprintf(stderr, "ERROR: Expected a parenthesis block, function or operator at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Expected a parenthesis block, function or operator\n");
                 return -1;
               }
             } else {
@@ -1609,21 +1691,20 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
                 case TFUNCTION: {
-                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, pos);
+                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, pos);
                   /* LCOV_EXCL_START*/
                   if(x == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
                   /* LCOV_EXCL_STOP*/
-                  if(lexer_peek(obj, x->end + 1, &type) == 0) {
+
+                  if(lexer_peek(text, x->end, &type, &start, &len) >= 0) {
                     switch(type) {
                       case TSEMICOLON: {
-                        pos = x->end + 2;
-
                         int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
-                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->bytecode[x->step];
-                        struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->bytecode[step_out];
+                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->ast.buffer[x->step];
+                        struct vm_ttrue_t *t = (struct vm_ttrue_t *)&obj->ast.buffer[step_out];
                         f->ret = tmp;
 
                         int i = 0;
@@ -1643,15 +1724,14 @@ static int rule_parse(struct rules_t *obj) {
 
                         go = TIF;
                         step_out = tmp;
+                        pos = x->end + 1;
                         vm_cache_del(x->start);
                       } break;
                       case TOPERATOR: {
                         go = type;
                       } break;
                       default: {
-                        int val = 0;
-                        lexer_bytecode_pos(obj, pos+1, &val);
-                        fprintf(stderr, "ERROR: Expected an semicolon or operator at position #%d\n", val+1);
+                        fprintf(stderr, "ERROR: Expected an semicolon or operator\n");
                         return -1;
                       } break;
                     }
@@ -1664,27 +1744,42 @@ static int rule_parse(struct rules_t *obj) {
 
                   int tmp = vm_rewind(obj, step_out, TIF);
                   if(has_if > 0) {
-                    struct vm_cache_t *cache = vm_cache_get(TIF, tmp, -1);
-                    /* LCOV_EXCL_START*/
-                    if(cache == NULL) {
+                    r_rewind = has_if;
+
+                    if(lexer_peek(text, pos, &type, &start, &len) < 0 || type != TEND) {
+                      /* LCOV_EXCL_START*/
                       fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                       return -1;
+                      /* LCOV_EXCL_STOP*/
                     }
-                    /* LCOV_EXCL_STOP*/
 
-                    cache->end = pos;
+                    pos++;
 
-                    r_rewind = cache->start;
+                    vm_cache_add(TIF, tmp, has_if, pos);
                   }
                   if(has_if == 0) {
-                    step = vm_parent(obj, TEOF, -1);
+                    struct vm_tstart_t *b = (struct vm_tstart_t *)&obj->ast.buffer[startnode];
+                    struct vm_tif_t *a = (struct vm_tif_t *)&obj->ast.buffer[tmp];
+                    b->go = tmp;
+                    a->ret = startnode;
+
+                    step = vm_parent(text, obj, TEOF, 0, 0, 0);
 #ifdef DEBUG
                     printf("nr steps: %d\n", step);/*LCOV_EXCL_LINE*/
 #endif
                     tmp = vm_rewind(obj, tmp, TSTART);
 
-                    struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[tmp];
+                    struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[tmp];
                     node->ret = step;
+
+                    if(lexer_peek(text, pos, &type, &start, &len) < 0) {
+                      /* LCOV_EXCL_START*/
+                      fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+                      return -1;
+                      /* LCOV_EXCL_STOP*/
+                    }
+
+                    pos++;
                   }
 
                   /*
@@ -1692,7 +1787,6 @@ static int rule_parse(struct rules_t *obj) {
                    */
                   if(has_if == 0) {
                     loop = 0;
-                    obj->pos.vars = obj->nrbytes;
                   }
 
                   pos = 0;
@@ -1705,9 +1799,7 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
                 default: {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos-1, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val+1);
+                  fprintf(stderr, "ERROR: Unexpected token\n");
                   return -1;
                 } break;
               }
@@ -1715,12 +1807,14 @@ static int rule_parse(struct rules_t *obj) {
           } else {
             int t = 0;
 
-            if(lexer_peek(obj, pos, &type) < 0) {
+            if(lexer_peek(text, pos, &type, &start, &len) < 0) {
               /* LCOV_EXCL_START*/
               fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
               return -1;
               /* LCOV_EXCL_STOP*/
             }
+
+            pos++;
 
             if(type == TTHEN) {
               t = TTRUE;
@@ -1732,15 +1826,22 @@ static int rule_parse(struct rules_t *obj) {
              * Predict how many go slots we need to
              * reserve for the TRUE / FALSE nodes.
              */
-            int y = pos, nrexpressions = 0;
-            while(lexer_peek(obj, y++, &type) == 0) {
+            int y = pos, nrexpressions = 0, z = 0;
+
+            while((z = lexer_peek(text, y++, &type, &start, &len)) >= 0) {
               if(type == TEOF) {
                 break;
               }
               if(type == TIF) {
-                struct vm_cache_t *cache = vm_cache_get(TIF, -1, y-1);
+                struct vm_cache_t *cache = vm_cache_get(TIF, y-1);
+                if(cache == NULL) {
+                  /* LCOV_EXCL_START*/
+                  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+                  return -1;
+                  /* LCOV_EXCL_STOP*/
+                }
                 nrexpressions++;
-                y = cache->end + 1;
+                y = cache->end;
                 continue;
               }
               if(type == TEND) {
@@ -1755,15 +1856,12 @@ static int rule_parse(struct rules_t *obj) {
             }
 
             if(nrexpressions == 0) {
-              int val = 0;
-              lexer_bytecode_pos(obj, pos+1, &val);
-              fprintf(stderr, "ERROR: If block without body at position #%d\n", val+1);
+              fprintf(stderr, "ERROR: If block without body\n");
               return -1;
             }
 #ifdef DEBUG
             printf("nrexpressions: %d\n", nrexpressions);/*LCOV_EXCL_LINE*/
 #endif
-
             /*
              * If we came from further in the script
              * make sure we hook our 'then' and 'else'
@@ -1771,14 +1869,22 @@ static int rule_parse(struct rules_t *obj) {
              */
             step_out = vm_rewind(obj, step_out, TIF);
 
+            if(lexer_peek(text, pos, &type, &start, &len) < 0) {
+              /* LCOV_EXCL_START*/
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+              /* LCOV_EXCL_STOP*/
+            }
+
             /*
              * The last parameter is used for
              * for the number of operations the
              * TRUE of FALSE will forward to.
              */
-            step = vm_parent(obj, t, nrexpressions);
-            struct vm_ttrue_t *a = (struct vm_ttrue_t *)&obj->bytecode[step];
-            struct vm_tif_t *b = (struct vm_tif_t *)&obj->bytecode[step_out];
+            step = vm_parent(text, obj, t, 0, 0, nrexpressions);
+
+            struct vm_ttrue_t *a = (struct vm_ttrue_t *)&obj->ast.buffer[step];
+            struct vm_tif_t *b = (struct vm_tif_t *)&obj->ast.buffer[step_out];
 
             if(t == TTRUE) {
               b->true_ = step;
@@ -1790,17 +1896,16 @@ static int rule_parse(struct rules_t *obj) {
             go = TIF;
 
             step_out = step;
-            pos++;
           }
         } break;
         case TOPERATOR: {
-          int a = -1, val = 0;
+          int a = -1;
           int source = step_out;
 
-          if(lexer_peek(obj, pos, &a) == 0) {
+          if(lexer_peek(text, pos, &a, &start, &len) >= 0) {
             switch(a) {
               case LPAREN: {
-                struct vm_cache_t *x = vm_cache_get(LPAREN, -1, pos);
+                struct vm_cache_t *x = vm_cache_get(LPAREN, pos);
                 /* LCOV_EXCL_START*/
                 if(x == NULL) {
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -1813,7 +1918,7 @@ static int rule_parse(struct rules_t *obj) {
                 vm_cache_del(oldpos);
               } break;
               case TFUNCTION: {
-                struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, pos);
+                struct vm_cache_t *x = vm_cache_get(TFUNCTION, pos);
                 /* LCOV_EXCL_START*/
                 if(x == NULL) {
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -1825,15 +1930,15 @@ static int rule_parse(struct rules_t *obj) {
                 step_out = x->step;
                 vm_cache_del(oldpos);
               } break;
-              case TVAR: {
-                step_out = vm_parent(obj, a, pos);
-              } break;
-              case TNUMBER: {
-                lexer_bytecode_pos(obj, pos, &val);
-                step_out = val;
-              } break;
-              case VNULL: {
-                step_out = vm_parent(obj, a, pos);
+              case TVAR:
+              case VNULL:
+              case TNUMBER1:
+              case TNUMBER2:
+              case TNUMBER3:
+              case VFLOAT:
+              case VINTEGER: {
+                step_out = vm_parent(text, obj, a, start, len, 0);
+                pos++;
               } break;
               /* LCOV_EXCL_START*/
               default: {
@@ -1848,22 +1953,22 @@ static int rule_parse(struct rules_t *obj) {
            * The return value is the positition
            * of the root operator
            */
-          int step = lexer_parse_math_order(obj, TOPERATOR, &pos, &step_out, source);
+          int step = lexer_parse_math_order(text, length, obj, TOPERATOR, &pos, &step_out, offset, source);
           if(step == -1) {
             return -1;
           }
 
           {
-            struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[step_out];
+            struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[step_out];
             node->ret = source;
 
-            switch(obj->bytecode[source]) {
+            switch(obj->ast.buffer[source]) {
               case TIF: {
-                struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[source];
+                struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[source];
                 node->go = step;
               } break;
               case TVAR: {
-                struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[source];
+                struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[source];
                 node->go = step;
               } break;
               /*
@@ -1871,7 +1976,7 @@ static int rule_parse(struct rules_t *obj) {
                * argument, attach it to a empty go slot
                */
               case TFUNCTION: {
-                struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[source];
+                struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[source];
                 int i = 0;
                 for(i=0;i<node->nrgo;i++) {
                   if(node->go[i] == 0) {
@@ -1884,15 +1989,12 @@ static int rule_parse(struct rules_t *obj) {
                 continue;
               } break;
               default: {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos, &val);
-                fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Unexpected token\n");
                 return -1;
               } break;
             }
           }
-          if(lexer_peek(obj, pos+1, &type) == 0) {
-            pos++;
+          if(lexer_peek(text, pos, &type, &start, &len) >= 0) {
             switch(type) {
               case TTHEN: {
                 go = TIF;
@@ -1901,64 +2003,26 @@ static int rule_parse(struct rules_t *obj) {
                 go = TVAR;
               } break;
               default: {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos, &val);
-                fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Unexpected token\n");
                 return -1;
               } break;
             }
           }
         } break;
-        /*
-         * In case numbers are seperate nodes
-         */
-        /*
-        case TNUMBER: {
-          struct vm_tnumber_t *node = NULL;
-          if(lexer_peek(obj, pos, &type) < 0) {
-            fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-            return -1;
-          }
-
-          step = vm_parent(obj, TNUMBER, pos);
-
-          pos++;
-
-          switch((obj->bytecode[step_out])) {
-            case TVAR: {
-              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[step_out];
-              tmp->go = step;
-            } break;
-            default: {
-              printf("err: %s %d\n", __FUNCTION__, __LINE__);
-              exit(-1);
-            } break;
-          }
-
-          node = (struct vm_tnumber_t *)&obj->bytecode[step];
-          node->ret = step_out;
-
-          int tmp = vm_rewind2(obj, step_out, TVAR, TOPERATOR);
-          go = (obj->bytecode[tmp]);
-          step_out = step;
-        } break;
-        */
         case VNULL: {
           struct vm_vnull_t *node = NULL;
-          if(lexer_peek(obj, pos, &type) < 0) {
+          if(lexer_peek(text, pos, &type, &start, &len) < 0) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
             /* LCOV_EXCL_STOP*/
           }
 
-          step = vm_parent(obj, VNULL, pos);
-
+          step = vm_parent(text, obj, VNULL, start, len, 0);
           pos++;
-
-          switch((obj->bytecode[step_out])) {
+          switch((obj->ast.buffer[step_out])) {
             case TVAR: {
-              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[step_out];
+              struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[step_out];
               tmp->go = step;
             } break;
             /*
@@ -1972,11 +2036,11 @@ static int rule_parse(struct rules_t *obj) {
             /* LCOV_EXCL_STOP*/
           }
 
-          node = (struct vm_vnull_t *)&obj->bytecode[step];
+          node = (struct vm_vnull_t *)&obj->ast.buffer[step];
           node->ret = step_out;
 
           int tmp = vm_rewind2(obj, step_out, TVAR, TOPERATOR);
-          go = (obj->bytecode[tmp]);
+          go = (obj->ast.buffer[tmp]);
           step_out = step;
         } break;
         /* LCOV_EXCL_START*/
@@ -1990,16 +2054,23 @@ static int rule_parse(struct rules_t *obj) {
            * We came from the TRUE node from the IF root,
            * which means we start parsing the variable name.
            */
-          if((obj->bytecode[step_out]) == TTRUE || (obj->bytecode[step_out]) == TFALSE) {
+          if((obj->ast.buffer[step_out]) == TTRUE || (obj->ast.buffer[step_out]) == TFALSE) {
             struct vm_tvar_t *node = NULL;
             struct vm_ttrue_t *node1 = NULL;
 
-            step = vm_parent(obj, TVAR, pos);
+            if(lexer_peek(text, pos, &type, &start, &len) < 0) {
+              /* LCOV_EXCL_START*/
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+              /* LCOV_EXCL_STOP*/
+            }
 
-            node = (struct vm_tvar_t *)&obj->bytecode[step];
-            node1 = (struct vm_ttrue_t *)&obj->bytecode[step_out];
+            step = vm_parent(text, obj, TVAR, start, len, 0);
 
             pos++;
+
+            node = (struct vm_tvar_t *)&obj->ast.buffer[step];
+            node1 = (struct vm_ttrue_t *)&obj->ast.buffer[step_out];
 
             int x = 0;
             for(x=0;x<node1->nrgo;x++) {
@@ -2019,14 +2090,16 @@ static int rule_parse(struct rules_t *obj) {
 
             step_out = step;
 
-            if(lexer_peek(obj, pos++, &type) < 0 || type != TASSIGN) {
+            if(lexer_peek(text, pos, &type, &start, &len) < 0 || type != TASSIGN) {
               /* LCOV_EXCL_START*/
               fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
               return -1;
               /* LCOV_EXCL_STOP*/
             }
 
-            if(lexer_peek(obj, pos+1, &type) == 0 && type == TOPERATOR) {
+            pos++;
+
+            if(lexer_peek(text, pos+1, &type, &start, &len) >= 0 && type == TOPERATOR) {
               switch(type) {
                 case TOPERATOR: {
                   go = TOPERATOR;
@@ -2034,14 +2107,22 @@ static int rule_parse(struct rules_t *obj) {
                   continue;
                 } break;
               }
-            } else if(lexer_peek(obj, pos, &type) == 0) {
+            } else if(lexer_peek(text, pos, &type, &start, &len) >= 0) {
               switch(type) {
-                case TNUMBER: {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos, &val);
-                  node->go = val;
-                  go = TVAR;
+                case VINTEGER:
+                case VFLOAT:
+                case TNUMBER1:
+                case TNUMBER2:
+                case TNUMBER3: {
+                  int foo = vm_parent(text, obj, type, start, len, 0);
+                  struct vm_tgeneric_t *a = (struct vm_tgeneric_t *)&obj->ast.buffer[foo];
+                  node = (struct vm_tvar_t *)&obj->ast.buffer[step];
+                  node->go = foo;
+                  a->ret = step;
+
                   pos++;
+
+                  go = TVAR;
                 } break;
                 case TVAR: {
                   go = TVAR;
@@ -2052,37 +2133,34 @@ static int rule_parse(struct rules_t *obj) {
                   step_out = step;
                 } break;
                 case TFUNCTION: {
-                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, pos);
+                  struct vm_cache_t *x = vm_cache_get(TFUNCTION, pos);
                   /* LCOV_EXCL_START*/
                   if(x == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
                   /* LCOV_EXCL_STOP*/
-                  if(lexer_peek(obj, x->end + 1, &type) == 0) {
+                  if(lexer_peek(text, x->end, &type, &start, &len) >= 0) {
                     switch(type) {
                       case TSEMICOLON: {
-                        pos = x->end + 2;
-
-                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->bytecode[x->step];
-                        struct vm_tvar_t *v = (struct vm_tvar_t *)&obj->bytecode[step_out];
+                        struct vm_tfunction_t *f = (struct vm_tfunction_t *)&obj->ast.buffer[x->step];
+                        struct vm_tvar_t *v = (struct vm_tvar_t *)&obj->ast.buffer[step_out];
                         f->ret = step;
                         v->go = x->step;
 
                         int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
                         int tmp1 = vm_rewind2(obj, tmp, TIF, TEVENT);
 
-                        go = obj->bytecode[tmp1];
+                        go = obj->ast.buffer[tmp1];
                         step_out = tmp;
+                        pos = x->end + 1;
                         vm_cache_del(x->start);
                       } break;
                       case TOPERATOR: {
                         go = type;
                       } break;
                       default: {
-                        int val = 0;
-                        lexer_bytecode_pos(obj, x->end - 1, &val);
-                        fprintf(stderr, "ERROR: Expected an semicolon or operator at position #%d\n", val);
+                        fprintf(stderr, "ERROR: Expected an semicolon or operator\n");
                         return -1;
                       } break;
                     }
@@ -2090,19 +2168,18 @@ static int rule_parse(struct rules_t *obj) {
                 } break;
                 case LPAREN: {
                   int oldpos = pos;
-                  struct vm_cache_t *x = vm_cache_get(LPAREN, -1, pos);
+                  struct vm_cache_t *x = vm_cache_get(LPAREN, pos);
                   /* LCOV_EXCL_START*/
                   if(x == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
-                  /* LCOV_EXCL_STOP*/
-                  if(lexer_peek(obj, x->end + 1, &type) == 0) {
-                    if(type == TSEMICOLON) {
-                      pos = x->end + 2;
 
-                      struct vm_lparen_t *l = (struct vm_lparen_t *)&obj->bytecode[x->step];
-                      struct vm_tvar_t *v = (struct vm_tvar_t *)&obj->bytecode[step_out];
+                  /* LCOV_EXCL_STOP*/
+                  if(lexer_peek(text, x->end, &type, &start, &len) >= 0) {
+                    if(type == TSEMICOLON) {
+                      struct vm_lparen_t *l = (struct vm_lparen_t *)&obj->ast.buffer[x->step];
+                      struct vm_tvar_t *v = (struct vm_tvar_t *)&obj->ast.buffer[step_out];
                       l->ret = step;
                       v->go = x->step;
 
@@ -2111,6 +2188,8 @@ static int rule_parse(struct rules_t *obj) {
                       go = TIF;
                       step_out = tmp;
 
+                      pos = x->end + 1;
+
                       vm_cache_del(oldpos);
                     } else {
                       go = type;
@@ -2118,9 +2197,7 @@ static int rule_parse(struct rules_t *obj) {
                   }
                 } break;
                 default: {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val);
+                  fprintf(stderr, "ERROR: Unexpected token\n");
                   return -1;
                 } break;
               }
@@ -2133,40 +2210,45 @@ static int rule_parse(struct rules_t *obj) {
           /*
            * The variable has been called as a value
            */
-          } else if((obj->bytecode[step_out]) == TVAR && lexer_peek(obj, pos, &type) == 0 && type != TSEMICOLON) {
-            if(lexer_peek(obj, pos, &type) == 0 && type == TVAR) {
-              step = vm_parent(obj, TVAR, pos++);
+          } else if((obj->ast.buffer[step_out]) == TVAR && lexer_peek(text, pos, &type, &start, &len) >= 0 && type != TSEMICOLON) {
+            step = vm_parent(text, obj, TVAR, start, len, 0);
+            pos++;
 
-              struct vm_tvar_t *in = (struct vm_tvar_t *)&obj->bytecode[step];
-              struct vm_tvar_t *out = (struct vm_tvar_t *)&obj->bytecode[step_out];
-              in->ret = step_out;
-              out->go = step;
+            struct vm_tvar_t *in = (struct vm_tvar_t *)&obj->ast.buffer[step];
+            struct vm_tvar_t *out = (struct vm_tvar_t *)&obj->ast.buffer[step_out];
+            in->ret = step_out;
+            out->go = step;
 
-              if(lexer_peek(obj, pos, &type) == 0) {
-                switch(type) {
-                  case TSEMICOLON: {
-                    go = TVAR;
-                  } break;
-                  default: {
-                    int val = 0;
-                    lexer_bytecode_pos(obj, pos-1, &val);
-                    fprintf(stderr, "ERROR: Expected a semicolon at position #%d\n", val+1);
-                    return -1;
-                  } break;
-                }
+            if(lexer_peek(text, pos, &type, &start, &len) >= 0) {
+
+              switch(type) {
+                case TSEMICOLON: {
+                  go = TVAR;
+                } break;
+                default: {
+                  fprintf(stderr, "ERROR: Expected a semicolon\n");
+                  return -1;
+                } break;
               }
             }
           } else {
+            if(lexer_peek(text, pos, &type, &start, &len) < 0 || type != TSEMICOLON) {
+              /* LCOV_EXCL_START*/
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+              /* LCOV_EXCL_STOP*/
+            }
+
             int tmp = step_out;
             pos++;
             while(1) {
-              if((obj->bytecode[tmp]) != TTRUE &&
-                 (obj->bytecode[tmp]) != TFALSE) {
-                struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[tmp];
+              if((obj->ast.buffer[tmp]) != TTRUE &&
+                 (obj->ast.buffer[tmp]) != TFALSE) {
+                struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[tmp];
                 tmp = node->ret;
               } else {
                 int tmp1 = vm_rewind2(obj, tmp, TIF, TEVENT);
-                go = obj->bytecode[tmp1];
+                go = obj->ast.buffer[tmp1];
                 step_out = tmp;
                 break;
               }
@@ -2176,19 +2258,19 @@ static int rule_parse(struct rules_t *obj) {
         case TCEVENT: {
           struct vm_tcevent_t *node = NULL;
           /* LCOV_EXCL_START*/
-          if(lexer_peek(obj, pos, &type) < 0 || type != TCEVENT) {
+          if(lexer_peek(text, pos, &type, &start, &len) < 0 || type != TCEVENT) {
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
           }
           /* LCOV_EXCL_STOP*/
 
-          step = vm_parent(obj, TCEVENT, pos);
+          step = vm_parent(text, obj, TCEVENT, start, len, 0);
 
-          node = (struct vm_tcevent_t *)&obj->bytecode[step];
+          node = (struct vm_tcevent_t *)&obj->ast.buffer[step];
 
           pos++;
 
-          if(lexer_peek(obj, pos, &type) < 0) {
+          if(lexer_peek(text, pos, &type, &start, &len) < 0) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
@@ -2196,16 +2278,14 @@ static int rule_parse(struct rules_t *obj) {
           }
 
           if(type != TSEMICOLON) {
-            int val = 0;
-            lexer_bytecode_pos(obj, pos-1, &val);
-            fprintf(stderr, "ERROR: Expected a semicolon at position #%d\n", val);
+            fprintf(stderr, "ERROR: Expected a semicolon\n");
             return -1;
           }
 
           pos++;
 
           int tmp = vm_rewind2(obj, step_out, TTRUE, TFALSE);
-          struct vm_ttrue_t *node1 = (struct vm_ttrue_t *)&obj->bytecode[tmp];
+          struct vm_ttrue_t *node1 = (struct vm_ttrue_t *)&obj->ast.buffer[tmp];
 
           int x = 0;
           for(x=0;x<node1->nrgo;x++) {
@@ -2224,16 +2304,16 @@ static int rule_parse(struct rules_t *obj) {
           node->ret = step_out;
 
           int tmp1 = vm_rewind2(obj, step_out, TIF, TEVENT);
-          go = obj->bytecode[tmp1];
+          go = obj->ast.buffer[tmp1];
           step_out = tmp;
         } break;
         case LPAREN: {
-          int a = -1, b = -1, val = 0;
+          int a = -1, b = -1;
 
-          if(lexer_peek(obj, has_paren+1, &a) == 0) {
+          if(lexer_peek(text, has_paren+1, &a, &start, &len) >= 0) {
             switch(a) {
               case LPAREN: {
-                struct vm_cache_t *x = vm_cache_get(LPAREN, -1, has_paren+1);
+                struct vm_cache_t *x = vm_cache_get(LPAREN, has_paren+1);
                 /* LCOV_EXCL_START*/
                 if(x == NULL) {
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
@@ -2245,46 +2325,38 @@ static int rule_parse(struct rules_t *obj) {
                 vm_cache_del(has_paren+1);
               } break;
               case TFUNCTION: {
-                struct vm_cache_t *x = vm_cache_get(TFUNCTION, -1, has_paren+1);
+                struct vm_cache_t *x = vm_cache_get(TFUNCTION, has_paren+1);
                 /* LCOV_EXCL_START*/
                 if(x == NULL) {
                   fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                   return -1;
                 }
                 /* LCOV_EXCL_STOP*/
-                pos = x->end;
                 step_out = x->step;
+                pos = x->end;
                 vm_cache_del(has_paren+1);
               } break;
-              case TVAR: {
-                step_out = vm_parent(obj, a, has_paren+1);
+              case TVAR:
+              case VNULL:
+              case VINTEGER:
+              case VFLOAT:
+              case TNUMBER1:
+              case TNUMBER2:
+              case TNUMBER3: {
                 pos = has_paren + 1;
-              } break;
-              case TNUMBER: {
-                lexer_bytecode_pos(obj, has_paren + 1, &val);
-                step_out = val;
-                pos = has_paren + 1;
-              } break;
-              case VNULL: {
-                step_out = vm_parent(obj, a, pos);
-                pos = has_paren + 1;
+                step_out = vm_parent(text, obj, a, start, len, 0);
+                pos++;
               } break;
               case RPAREN: {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos+1, &val);
-                fprintf(stderr, "ERROR: Empty parenthesis block at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Empty parenthesis block\n");
                 return -1;
               } break;
               case TOPERATOR: {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos+1, &val);
-                fprintf(stderr, "ERROR: Unexpected operator at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Unexpected operator\n");
                 return -1;
               } break;
               default: {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos+1, &val);
-                fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val+1);
+                fprintf(stderr, "ERROR: Unexpected token\n");
                 return -1;
               }
             }
@@ -2294,9 +2366,9 @@ static int rule_parse(struct rules_t *obj) {
            * The return value is the positition
            * of the root operator
            */
-          int step = lexer_parse_math_order(obj, LPAREN, &pos, &step_out, 0);
+          int step = lexer_parse_math_order(text, length, obj, LPAREN, &pos, &step_out, offset, 0);
 
-          if(lexer_peek(obj, pos+1, &b) < 0) {
+          if(lexer_peek(text, pos, &b, &start, &len) < 0) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
@@ -2304,35 +2376,34 @@ static int rule_parse(struct rules_t *obj) {
           }
 
           if(b != RPAREN) {
-            int val = 0;
-            lexer_bytecode_pos(obj, pos, &val);
-            fprintf(stderr, "ERROR: Expected a closing parenthesis at position #%d\n", val+1);
+            fprintf(stderr, "ERROR: Expected a right parenthesis\n");
             return -1;
           }
 
+          pos++;
+
           {
-            struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->bytecode[step_out];
+            struct vm_tgeneric_t *node = (struct vm_tgeneric_t *)&obj->ast.buffer[step_out];
             node->ret = 0;
           }
 
-          if(lexer_peek(obj, has_paren, &type) < 0 || type != LPAREN) {
+          if(lexer_peek(text, has_paren, &type, &start, &len) < 0 || type != LPAREN) {
             /* LCOV_EXCL_START*/
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
             /* LCOV_EXCL_STOP*/
           }
 
-          while(lexer_peek(obj, ++pos, &type) == 0 && type != RPAREN);
+          step = vm_parent(text, obj, LPAREN, start, len, 0);
 
-          step = vm_parent(obj, LPAREN, has_paren);
-          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[step];
+          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[step];
           node->go = step_out;
 
           vm_cache_add(LPAREN, step, has_paren, pos);
 
           r_rewind = has_paren;
 
-          struct vm_tgeneric_t *node1 = (struct vm_tgeneric_t *)&obj->bytecode[step_out];
+          struct vm_tgeneric_t *node1 = (struct vm_tgeneric_t *)&obj->ast.buffer[step_out];
           node1->ret = step;
 
           go = -1;
@@ -2344,11 +2415,10 @@ static int rule_parse(struct rules_t *obj) {
           has_if = -1;
           has_on = -1;
           step_out = -1;
-
         } break;
         case TFUNCTION: {
           struct vm_tfunction_t *node = NULL;
-          int val = 0, arg = 0;
+          int arg = 0;
 
           /*
            * We've entered the function name,
@@ -2356,8 +2426,8 @@ static int rule_parse(struct rules_t *obj) {
            * root node.
            */
           if(step_out == -1) {
-            pos = has_function;
-            if(lexer_peek(obj, has_function, &type) < 0) {
+            pos = has_function+1;
+            if(lexer_peek(text, has_function, &type, &start, &len) < 0) {
               /* LCOV_EXCL_START*/
               fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
               return -1;
@@ -2368,19 +2438,31 @@ static int rule_parse(struct rules_t *obj) {
              * Determine how many arguments this
              * function has.
              */
-            int y = pos + 2, nrargs = 0;
-            while(lexer_peek(obj, y++, &type) == 0) {
+            int y = pos + 1, nrargs = 0;
+            while(lexer_peek(text, y++, &type, &start, &len) >= 0) {
               if(type == TEOF || type == RPAREN) {
                 break;
               }
               if(type == LPAREN) {
-                struct vm_cache_t *cache = vm_cache_get(LPAREN, -1, y-1);
-                y = cache->end + 1;
+                struct vm_cache_t *cache = vm_cache_get(LPAREN, y-1);
+                if(cache == NULL) {
+                  /* LCOV_EXCL_START*/
+                  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+                  return -1;
+                  /* LCOV_EXCL_STOP*/
+                }
+                y = cache->end;
                 continue;
               }
               if(type == TFUNCTION) {
-                struct vm_cache_t *cache = vm_cache_get(TFUNCTION, -1, y-1);
-                y = cache->end + 1;
+                struct vm_cache_t *cache = vm_cache_get(TFUNCTION, y-1);
+                if(cache == NULL) {
+                  /* LCOV_EXCL_START*/
+                  fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+                  return -1;
+                  /* LCOV_EXCL_STOP*/
+                }
+                y = cache->end;
                 continue;
               }
               if(type == TCOMMA) {
@@ -2390,19 +2472,17 @@ static int rule_parse(struct rules_t *obj) {
 #ifdef DEBUG
             printf("nrarguments: %d\n", nrargs + 1);/*LCOV_EXCL_LINE*/
 #endif
-            step = vm_parent(obj, TFUNCTION, nrargs + 1);
-
-            node = (struct vm_tfunction_t *)&obj->bytecode[step];
-
-            lexer_bytecode_pos(obj, pos++, &val);
-            node->token = val;
-
-            /* LCOV_EXCL_START*/
-            if(lexer_peek(obj, pos++, &type) < 0 || type != LPAREN) {
-                fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-                return -1;
+            if(lexer_peek(text, has_function, &type, &start, &len) < 0 || type != TFUNCTION) {
+              /* LCOV_EXCL_START*/
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+              /* LCOV_EXCL_STOP*/
             }
-            /* LCOV_EXCL_STOP*/
+
+            step = vm_parent(text, obj, TFUNCTION, start, len, nrargs + 1);
+
+            pos++;
+
           /*
            * When the root node has been created
            * we parse the different arguments.
@@ -2411,7 +2491,7 @@ static int rule_parse(struct rules_t *obj) {
             int i = 0;
             step = vm_rewind(obj, step_out, TFUNCTION);
 
-            node = (struct vm_tfunction_t *)&obj->bytecode[step];
+            node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
 
             /*
              * Find the argument we've just
@@ -2429,7 +2509,7 @@ static int rule_parse(struct rules_t *obj) {
              * of arguments
              */
             while(1) {
-              if(lexer_peek(obj, pos, &type) < 0) {
+              if(lexer_peek(text, pos, &type, &start, &len) < 0) {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                 return -1;
@@ -2443,9 +2523,9 @@ static int rule_parse(struct rules_t *obj) {
               if(type == RPAREN) {
                 break;
               }
-              pos++;
             }
-            lexer_peek(obj, pos, &type);
+
+            lexer_peek(text, pos, &type, &start, &len);
           }
 
           /*
@@ -2457,7 +2537,7 @@ static int rule_parse(struct rules_t *obj) {
            */
           if(type != RPAREN) {
             while(1) {
-              if(lexer_peek(obj, pos + 1, &type) < 0) {
+              if(lexer_peek(text, pos + 1, &type, &start, &len) < 0) {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                 return -1;
@@ -2468,7 +2548,7 @@ static int rule_parse(struct rules_t *obj) {
                 break;
               }
 
-              if(lexer_peek(obj, pos, &type) < 0) {
+              if(lexer_peek(text, pos, &type, &start, &len) < 0) {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                 return -1;
@@ -2481,63 +2561,72 @@ static int rule_parse(struct rules_t *obj) {
                  * another function, link those together.
                  */
                 case LPAREN: {
-                  struct vm_cache_t *cache = vm_cache_get(LPAREN, -1, pos);
-                  struct vm_lparen_t *paren = (struct vm_lparen_t *)&obj->bytecode[cache->step];
+                  struct vm_cache_t *cache = vm_cache_get(LPAREN, pos);
                   /* LCOV_EXCL_START*/
                   if(cache == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
                   /* LCOV_EXCL_STOP*/
+
+                  node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
+                  struct vm_lparen_t *paren = (struct vm_lparen_t *)&obj->ast.buffer[cache->step];
                   int oldpos = pos;
-                  pos = cache->end + 1;
+                  pos = cache->end;
                   node->go[arg++] = cache->step;
                   paren->ret = step;
                   vm_cache_del(oldpos);
                 } break;
                 case TFUNCTION: {
-                  struct vm_cache_t *cache = vm_cache_get(TFUNCTION, -1, pos);
-                  struct vm_tfunction_t *func = (struct vm_tfunction_t *)&obj->bytecode[cache->step];
+                  struct vm_cache_t *cache = vm_cache_get(TFUNCTION, pos);
                   /* LCOV_EXCL_START*/
                   if(cache == NULL) {
                     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                     return -1;
                   }
+
+                  node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
+                  struct vm_tfunction_t *func = (struct vm_tfunction_t *)&obj->ast.buffer[cache->step];
                   /* LCOV_EXCL_STOP*/
                   int oldpos = pos;
-                  pos = cache->end + 1;
+                  pos = cache->end;
 
                   node->go[arg++] = cache->step;
                   func->ret = step;
                   vm_cache_del(oldpos);
                 } break;
-                case TNUMBER: {
-                  lexer_bytecode_pos(obj, pos++, &val);
-                  node->go[arg++] = val;
-                } break;
-                case VNULL: {
-                  int a = vm_parent(obj, VNULL, pos++);
-                  node = (struct vm_tfunction_t *)&obj->bytecode[step];
+                case TNUMBER1:
+                case TNUMBER2:
+                case TNUMBER3: {
+                  int a = vm_parent(text, obj, type, start, len, 0);
+
+                  pos++;
+
+                  node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
                   node->go[arg++] = a;
-                  struct vm_vnull_t *tmp = (struct vm_vnull_t *)&obj->bytecode[a];
+
+                  struct vm_tnumber_t *tmp = (struct vm_tnumber_t *)&obj->ast.buffer[a];
                   tmp->ret = step;
                 } break;
+                case VNULL:
                 case TVAR: {
-                  int a = vm_parent(obj, TVAR, pos++);
-                  node = (struct vm_tfunction_t *)&obj->bytecode[step];
+                  int a = vm_parent(text, obj, type, start, len, 0);
+
+                  pos++;
+
+                  node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
                   node->go[arg++] = a;
-                  struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[a];
+
+                  struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[a];
                   tmp->ret = step;
                 } break;
                 default: {
-                  int val = 0;
-                  lexer_bytecode_pos(obj, pos, &val);
-                  fprintf(stderr, "ERROR: Unexpected token at position #%d\n", val);
+                  fprintf(stderr, "ERROR: Unexpected token\n");
                   return -1;
                 } break;
               }
 
-              if(lexer_peek(obj, pos++, &type) < 0) {
+              if(lexer_peek(text, pos, &type, &start, &len) < 0) {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
                 return -1;
@@ -2549,15 +2638,23 @@ static int rule_parse(struct rules_t *obj) {
                * reached the end of the argument list
                */
               if(type == RPAREN) {
+                pos++;
                 break;
               } else if(type != TCOMMA) {
-                int val = 0;
-                lexer_bytecode_pos(obj, pos-1, &val);
-                fprintf(stderr, "ERROR: Expected a closing parenthesis at position #%d\n", val-1);
+                fprintf(stderr, "ERROR: Expected a closing parenthesis\n");
                 return -1;
               }
+
+              pos++;
             }
           } else {
+            if(lexer_peek(text, pos, &type, &start, &len) < 0) {
+              /* LCOV_EXCL_START*/
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+              /* LCOV_EXCL_STOP*/
+            }
+
             pos++;
           }
 
@@ -2566,7 +2663,7 @@ static int rule_parse(struct rules_t *obj) {
            * root, cache it for further linking.
            */
           if(go == TFUNCTION) {
-            vm_cache_add(TFUNCTION, step, has_function, pos - 1);
+            vm_cache_add(TFUNCTION, step, has_function, pos);
 
             r_rewind = has_function;
 
@@ -2580,7 +2677,6 @@ static int rule_parse(struct rules_t *obj) {
             has_on = -1;
             step_out = -1;
           }
-
         } break;
       }
     } else {
@@ -2590,7 +2686,7 @@ static int rule_parse(struct rules_t *obj) {
        * it first.
        */
       if(r_rewind == -1) {
-        if(lexer_peek(obj, pos++, &type) < 0) {
+        if(lexer_peek(text, pos++, &type, &start, &len) < 0) {
           /* LCOV_EXCL_START*/
           fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
           return -1;
@@ -2601,7 +2697,7 @@ static int rule_parse(struct rules_t *obj) {
        * by step until we are at the beginning again.
        */
       } else {
-        if(r_rewind > 0 && lexer_peek(obj, --r_rewind, &type) < 0) {
+        if(r_rewind > 0 && lexer_peek(text, --r_rewind, &type, &start, &len) < 0) {
           go = -1;
         }
         pos = r_rewind+1;
@@ -2612,25 +2708,33 @@ static int rule_parse(struct rules_t *obj) {
         has_if = pos-1;
       } else if(type == TEVENT) {
         has_on = pos-1;
-      } else if(type == LPAREN && lexer_peek(obj, pos-2, &type1) == 0 && type1 != TFUNCTION) {
+      } else if(type == LPAREN &&
+        lexer_peek(text, pos-2, &type1, &start, &len) >= 0 &&
+         type1 != TFUNCTION && type1 != TCEVENT) {
         has_paren = pos-1;
       }
       if(has_function != -1 || has_paren != -1 || has_if != -1 || has_on != -1) {
         if(type == TEOF || r_rewind > -1) {
           if(max(has_function, max(has_paren, max(has_if, has_on))) == has_function) {
-            pos = has_function;
+            offset = (pos = has_function)+1;
             go = TFUNCTION;
             continue;
           } else if(max(has_function, max(has_paren, max(has_if, has_on))) == has_if) {
-            pos = has_if;
+            offset = (pos = has_if);
+            if(has_if > 0) {
+              offset++;
+            }
             go = TIF;
             continue;
           } else if(max(has_function, max(has_paren, max(has_if, has_on))) == has_on) {
-            pos = has_on;
+            offset = (pos = has_on);
             go = TEVENT;
+            if(has_on > 0) {
+              offset++;
+            }
             continue;
           } else {
-            pos = has_paren;
+            offset = (pos = has_paren)+1;
             go = LPAREN;
             continue;
           }
@@ -2662,11 +2766,7 @@ static int rule_parse(struct rules_t *obj) {
   }
 
 /* LCOV_EXCL_START*/
-  if(obj->pos.parsed == 0) {
-    fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-    return -1;
-  }
-  struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[obj->pos.parsed];
+  struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[0];
   if(node->go == 0) {
     fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
     return -1;
@@ -2680,34 +2780,26 @@ static int rule_parse(struct rules_t *obj) {
 static void print_ast(struct rules_t *obj) {
   int i = 0, x = 0;
 
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == 0 && obj->bytecode[i+1] == 0) {
-      x = i+2;
-      break;
-    }
-  }
-  for(i=x;alignedbytes(i)<obj->nrbytes;i++) {
+  for(i=x;alignedbytes(i)<obj->ast.nrbytes;i++) {
     i = alignedbytes(i);
-    switch(obj->bytecode[i]) {
+    switch(obj->ast.buffer[i]) {
       case TSTART: {
-        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[i];
+        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[i];
         printf("\"%d\"[label=\"START\"]\n", i);
         printf("\"%d\" -> \"%d\"\n", i, node->go);
         printf("\"%d\" -> \"%d\"\n", i, node->ret);
         i+=sizeof(struct vm_tstart_t)-1;
       } break;
       case TEOF: {
-        struct vm_teof_t *node = (struct vm_teof_t *)&obj->bytecode[i];
         printf("\"%d\"[label=\"EOF\"]\n", i);
         i+=sizeof(struct vm_teof_t)-1;
       } break;
       case VNULL: {
-        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[i];
         printf("\"%d\"[label=\"NULL\"]\n", i);
         i+=sizeof(struct vm_vnull_t)-1;
       } break;
       case TIF: {
-        struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[i];
+        struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[i];
         printf("\"%d\"[label=\"IF\"]\n", i);
         printf("\"%d\" -> \"%d\"\n", i, node->go);
         // printf("\"%i\" -> \"%i\"\n", i, node->ret);
@@ -2728,7 +2820,7 @@ static void print_ast(struct rules_t *obj) {
         i+=sizeof(struct vm_tif_t)-1;
       } break;
       case LPAREN: {
-        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[i];
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[i];
         printf("\"%d\"[label=\"(\"]\n", i);
         printf("\"%d\" -> \"%d\"\n", i, node->go);
         // printf("\"%d\" -> \"%d\"\n", i, node->ret);
@@ -2737,8 +2829,8 @@ static void print_ast(struct rules_t *obj) {
       case TFALSE:
       case TTRUE: {
         int x = 0;
-        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[i];
-        if((obj->bytecode[i]) == TFALSE) {
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[i];
+        if((obj->ast.buffer[i]) == TFALSE) {
           printf("\"%d\"[label=\"FALSE\"]\n", i);
         } else {
           printf("\"%d\"[label=\"TRUE\"]\n", i);
@@ -2754,46 +2846,61 @@ static void print_ast(struct rules_t *obj) {
           }
         }
         printf(" rankdir = LR}\n");
-        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo);
+        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TFUNCTION: {
         int x = 0;
-        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[i];
-        printf("\"%d\"[label=\"%s\"]\n", i, event_functions[obj->bytecode[node->token+1]].name);
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%s\"]\n", i, rule_functions[node->token].name);
         for(x=0;x<node->nrgo;x++) {
           printf("\"%d\" -> \"%d\"\n", i, node->go[x]);
         }
         // printf("\"%d\" -> \"%d\"\n", i, node->ret);
-        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo);
+        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TVAR: {
-        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[i];
-        printf("\"%d\"[label=\"%s\"]\n", i, &obj->bytecode[node->token+1]);
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%s\"]\n", i, node->token);
         if(node->go > 0) {
           printf("\"%d\" -> \"%d\"\n", i, node->go);
         }
         // printf("\"%d\" -> \"%d\"\n", i, node->ret);
-        i+=sizeof(struct vm_tvar_t)-1;
+        i+=sizeof(struct vm_tvar_t)+strlen((char *)node->token);
+      } break;
+      case TNUMBER: {
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%s\"]\n", i, node->token);
+        i+=sizeof(struct vm_tnumber_t)+strlen((char *)node->token);
+      } break;
+      case VINTEGER: {
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%d\"]\n", i, node->value);
+        i+=sizeof(struct vm_vinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%g\"]\n", i, node->value);
+        i+=sizeof(struct vm_vfloat_t)-1;
       } break;
       case TEVENT: {
-        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-        printf("\"%d\"[label=\"%s\"]\n", i, &obj->bytecode[node->token+1]);
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%s\"]\n", i, node->token);
         // printf("\"%i\" -> \"%i\"\n", i, node->ret);
         if(node->go > 0) {
           printf("\"%d\" -> \"%d\"\n", i, node->go);
         }
-        i+=sizeof(struct vm_tevent_t)-1;
+        i+=sizeof(struct vm_tevent_t)+strlen((char *)node->token);
       } break;
       case TCEVENT: {
-        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->bytecode[i];
-        printf("\"%d\"[label=\"%s\"]\n", i, &obj->bytecode[node->token+1]);
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[i];
+        printf("\"%d\"[label=\"%s\"]\n", i, node->token);
         // printf("\"%i\" -> \"%i\"\n", i, node->ret);
-        i+=sizeof(struct vm_tcevent_t)-1;
+        i+=sizeof(struct vm_tcevent_t)+strlen((char *)node->token);
       } break;
       case TOPERATOR: {
-        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[i];
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[i];
 
-        printf("\"%d\"[label=\"%s\"]\n", i, event_operators[obj->bytecode[node->token+1]].name);
+        printf("\"%d\"[label=\"%s\"]\n", i, rule_operators[node->token].name);
         printf("\"%d\" -> \"%d\"\n", i, node->right);
         printf("\"%d\" -> \"%d\"\n", i, node->left);
         printf("{ rank=same edge[style=invis] \"%d\" -> \"%d\" rankdir = LR}\n", node->left, node->right);
@@ -2809,171 +2916,181 @@ static void print_ast(struct rules_t *obj) {
 static void print_steps(struct rules_t *obj) {
   int i = 0, x = 0;
 
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == 0 && obj->bytecode[i+1] == 0) {
-      x = i+2;
-      break;
-    }
-  }
-  for(i=x;alignedbytes(i)<obj->nrbytes;i++) {
+  for(i=x;alignedbytes(i)<obj->ast.nrbytes;i++) {
     i = alignedbytes(i);
-    switch(obj->bytecode[i]) {
+    switch(obj->ast.buffer[i]) {
       case TSTART: {
-        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"START\"]\n", node);
-        printf("\"%p-3\"[label=\"%d\" shape=square]\n", node, node->ret);
-        printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->go);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-4\"\n", node, node);
+        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"START\"]\n", i);
+        printf("\"%d-3\"[label=\"%d\" shape=square]\n", i, node->ret);
+        printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->go);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-4\"\n", i, i);
         i+=sizeof(struct vm_tstart_t)-1;
       } break;
       case TEOF: {
-        struct vm_teof_t *node = (struct vm_teof_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"EOF\"]\n", node);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"EOF\"]\n", i);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
         i+=sizeof(struct vm_teof_t)-1;
       } break;
       case VNULL: {
-        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"NULL\"]\n", node);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
+        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"NULL\"]\n", i);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
         i+=sizeof(struct vm_vnull_t)-1;
       } break;
       case TIF: {
-        struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[i];
-        printf("\"%p-2\"[label=\"IF\"]\n", node);
-        printf("\"%p-2\" -> \"%p-4\"\n", node, node);
+        struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[i];
+        printf("\"%d-2\"[label=\"IF\"]\n", i);
+        printf("\"%d-2\" -> \"%d-4\"\n", i, i);
         if(node->true_ > 0) {
-          printf("\"%p-2\" -> \"%p-6\"\n", node, node);
+          printf("\"%d-2\" -> \"%d-6\"\n", i, i);
         }
         if(node->false_ > 0) {
-          printf("\"%p-2\" -> \"%p-7\"\n", node, node);
+          printf("\"%d-2\" -> \"%d-7\"\n", i, i);
         }
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
         if(node->true_ > 0) {
-          printf("\"%p-6\"[label=\"%d\" shape=square]\n", node, node->true_);
+          printf("\"%d-6\"[label=\"%d\" shape=square]\n", i, node->true_);
         }
         if(node->false_ > 0) {
-          printf("\"%p-7\"[label=\"%d\" shape=square]\n", node, node->false_);
+          printf("\"%d-7\"[label=\"%d\" shape=square]\n", i, node->false_);
         }
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->go);
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->go);
         i+=sizeof(struct vm_tif_t)-1;
       } break;
       case LPAREN: {
-        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"(\"]\n", node);
-        printf("\"%p-2\" -> \"%p-4\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->go);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"(\"]\n", i);
+        printf("\"%d-2\" -> \"%d-4\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->go);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
         i+=sizeof(struct vm_lparen_t)-1;
       } break;
       case TFALSE:
       case TTRUE: {
         int x = 0;
-        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        if((obj->bytecode[i]) == TFALSE) {
-          printf("\"%p-2\"[label=\"FALSE\"]\n", node);
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        if((obj->ast.buffer[i]) == TFALSE) {
+          printf("\"%d-2\"[label=\"FALSE\"]\n", i);
         } else {
-          printf("\"%p-2\"[label=\"TRUE\"]\n", node);
+          printf("\"%d-2\"[label=\"TRUE\"]\n", i);
         }
         for(x=0;x<node->nrgo;x++) {
-          printf("\"%p-2\" -> \"%p-%d\"\n", node, node, x+3);
-          printf("\"%p-%d\"[label=\"%d\" shape=square]\n", node, x+3, node->go[x]);
+          printf("\"%d-2\" -> \"%d-%d\"\n", i, i, x+3);
+          printf("\"%d-%d\"[label=\"%d\" shape=square]\n", i, x+3, node->go[x]);
         }
-        printf("\"%p-2\" -> \"%p-%d\"\n", node, node, x+4);
-        printf("\"%p-%d\"[label=\"%d\" shape=diamond]\n", node, x+4, node->ret);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo);
+        printf("\"%d-2\" -> \"%d-%d\"\n", i, i, x+4);
+        printf("\"%d-%d\"[label=\"%d\" shape=diamond]\n", i, x+4, node->ret);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TFUNCTION: {
         int x = 0;
-        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"%s\"]\n", node, event_functions[obj->bytecode[node->token+1]].name);
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%s\"]\n", i, rule_functions[node->token].name);
         for(x=0;x<node->nrgo;x++) {
-          printf("\"%p-2\" -> \"%p-%d\"\n", node, node, x+3);
-          printf("\"%p-%d\"[label=\"%d\" shape=square]\n", node, x+3, node->go[x]);
+          printf("\"%d-2\" -> \"%d-%d\"\n", i, i, x+3);
+          printf("\"%d-%d\"[label=\"%d\" shape=square]\n", i, x+3, node->go[x]);
         }
-        printf("\"%p-2\" -> \"%p-%d\"\n", node, node, x+4);
-        printf("\"%p-%d\"[label=\"%d\" shape=diamond]\n", node, x+4, node->ret);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo);
+        printf("\"%d-2\" -> \"%d-%d\"\n", i, i, x+4);
+        printf("\"%d-%d\"[label=\"%d\" shape=diamond]\n", i, x+4, node->ret);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TCEVENT: {
-        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"%s()\"]\n", node, &obj->bytecode[node->token+1]);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        i+=sizeof(struct vm_tcevent_t)-1;
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%s()\"]\n", i, node->token);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        i+=sizeof(struct vm_tcevent_t)+strlen((char *)node->token);
       } break;
       case TVAR: {
-        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"%s\"]\n", node, &obj->bytecode[node->token+1]);
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%s\"]\n", i, node->token);
         if(node->go > 0) {
-          printf("\"%p-2\" -> \"%p-4\"\n", node, node);
+          printf("\"%d-2\" -> \"%d-4\"\n", i, i);
         }
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
         if(node->go > 0) {
-          printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->go);
+          printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->go);
         }
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        i+=sizeof(struct vm_tvar_t)-1;
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        i+=sizeof(struct vm_tvar_t)+strlen((char *)node->token);
       } break;
       case TEVENT: {
-        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"%s\"]\n", node, &obj->bytecode[node->token+1]);
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%s\"]\n", i, node->token);
         if(node->go > 0) {
-          printf("\"%p-2\" -> \"%p-4\"\n", node, node);
+          printf("\"%d-2\" -> \"%d-4\"\n", i, i);
         }
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
         if(node->go > 0) {
-          printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->go);
+          printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->go);
         }
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        i+=sizeof(struct vm_tevent_t)-1;
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        i+=sizeof(struct vm_tevent_t)+strlen((char *)node->token);
       } break;
       case TNUMBER: {
-        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[i];
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-2\"[label=\"%s\"]\n", node, &obj->bytecode[node->token+1]);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, node);
-        printf("\"%p-3\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        i+=sizeof(struct vm_tnumber_t)-1;
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%s\"]\n", i, node->token);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        i+=sizeof(struct vm_tnumber_t)+strlen((char *)node->token)-1;
+      } break;
+      case VINTEGER: {
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%d\"]\n", i, node->value);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        i+=sizeof(struct vm_vinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-2\"[label=\"%g\"]\n", i, node->value);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        i+=sizeof(struct vm_vfloat_t)-1;
       } break;
       case TOPERATOR: {
-        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[i];
-
-        printf("\"%p-1\"[label=\"%d\" shape=square]\n", node, i);
-        printf("\"%p-3\"[label=\"%d\" shape=square]\n", node, node->left);
-        printf("\"%p-4\"[label=\"%d\" shape=square]\n", node, node->right);
-        printf("\"%p-2\"[label=\"%s\"]\n", node, event_operators[obj->bytecode[node->token+1]].name);
-        printf("\"%p-1\" -> \"%p-2\"\n", node, &obj->bytecode[i]);
-        printf("\"%p-5\"[label=\"%d\" shape=diamond]\n", node, node->ret);
-        printf("\"%p-2\" -> \"%p-3\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-4\"\n", node, node);
-        printf("\"%p-2\" -> \"%p-5\"\n", node, node);
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[i];
+        printf("\"%d-1\"[label=\"%d\" shape=square]\n", i, i);
+        printf("\"%d-3\"[label=\"%d\" shape=square]\n", i, node->left);
+        printf("\"%d-4\"[label=\"%d\" shape=square]\n", i, node->right);
+        printf("\"%d-2\"[label=\"%s\"]\n", i, rule_operators[node->token].name);
+        printf("\"%d-1\" -> \"%d-2\"\n", i, i);
+        printf("\"%d-5\"[label=\"%d\" shape=diamond]\n", i, node->ret);
+        printf("\"%d-2\" -> \"%d-3\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-4\"\n", i, i);
+        printf("\"%d-2\" -> \"%d-5\"\n", i, i);
         i+=sizeof(struct vm_toperator_t)-1;
-      } break;  
+      } break;
       default: {
       } break;
     }
@@ -2982,63 +3099,86 @@ static void print_steps(struct rules_t *obj) {
 
 static void print_tree(struct rules_t *obj) {
   print_steps(obj);
+  print_ast(obj);
 }
 #endif
 /*LCOV_EXCL_STOP*/
 
 static int vm_value_set(struct rules_t *obj, int step, int ret) {
-  int out = obj->nrbytes;
+  int out = obj->varstack.nrbytes;
 
-  int start = alignedbytes(obj->pos.parsed);
-
-  switch(obj->bytecode[step]) {
+#ifdef DEBUG
+  printf("%s %d %d\n", __FUNCTION__, __LINE__, out);
+#endif
+  switch(obj->ast.buffer[step]) {
     case TNUMBER: {
       float var = 0;
-      if(step > start) {
-        /*
-         * If numbers are seperate nodes
-         */
-        /*LCOV_EXCL_START*/
-        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[step];
-        var = atof((char *)&obj->bytecode[node->token+1]);
-        /*LCOV_EXCL_STOP*/
-      } else {
-        var = atof((char *)&obj->bytecode[step+1]);
+      struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[step];
+      var = atof((char *)node->token);
 
-      }
-      float nr = 0;
-
-      if(modff(var, &nr) == 0) {
-        if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vinteger_t))) == NULL) {
-          OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-        }
-
-        struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->bytecode[obj->nrbytes];
-        value->type = VINTEGER;
-        value->ret = ret;
-        value->value = (int)var;
-        obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vinteger_t);
-      } else {
-        if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vfloat_t))) == NULL) {
-          OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
-        }
-
-        struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->bytecode[obj->nrbytes];
-        value->type = VFLOAT;
-        value->ret = ret;
-        value->value = var;
-        obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vfloat_t);
-      }
-    } break;
-    case VNULL: {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vnull_t))) == NULL) {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(size))) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
 
-      struct vm_vnull_t *value = (struct vm_vnull_t *)&obj->bytecode[obj->nrbytes];
+      struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
+      value->type = VINTEGER;
+      value->ret = ret;
+      value->value = (int)var;
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
+#ifdef DEBUG
+      printf("%s %d %d %d\n", __FUNCTION__, __LINE__, out, (int)var);
+#endif
+    } break;
+    case VFLOAT: {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vfloat_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
+        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      }
+
+      struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
+      struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&obj->ast.buffer[step];
+      value->type = VFLOAT;
+      value->ret = ret;
+      value->value = cpy->value;
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
+#ifdef DEBUG
+      printf("%s %d %d %g\n", __FUNCTION__, __LINE__, out, cpy->value);
+#endif
+    } break;
+    case VINTEGER: {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
+        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      }
+
+      struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
+      struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&obj->ast.buffer[step];
+      value->type = VINTEGER;
+      value->ret = ret;
+      value->value = cpy->value;
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
+#ifdef DEBUG
+      printf("%s %d %d %d\n", __FUNCTION__, __LINE__, out, cpy->value);
+#endif
+    } break;
+    case VNULL: {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vnull_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
+        OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
+      }
+
+      struct vm_vnull_t *value = (struct vm_vnull_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
       value->type = VNULL;
       value->ret = ret;
-      obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vnull_t);
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
+#ifdef DEBUG
+      printf("%s %d %d NULL\n", __FUNCTION__, __LINE__, out);
+#endif
     } break;
     /* LCOV_EXCL_START*/
     default: {
@@ -3052,18 +3192,18 @@ static int vm_value_set(struct rules_t *obj, int step, int ret) {
 }
 
 static int vm_value_upd_pos(struct rules_t *obj, int val, int step) {
-  switch(obj->bytecode[step]) {
+  switch(obj->ast.buffer[step]) {
     case TOPERATOR: {
-      struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[step];
-      node->value = val;
+      struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[step];
+      obj->valstack.buffer[node->value] = val;
     } break;
     case TVAR: {
-      struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[step];
-      node->value = val;
+      struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[step];
+      obj->valstack.buffer[node->value] = val;
     } break;
     case TFUNCTION: {
-      struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[step];
-      node->value = val;
+      struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[step];
+      obj->valstack.buffer[node->value] = val;
     } break;
     case VNULL: {
     } break;
@@ -3077,73 +3217,46 @@ static int vm_value_upd_pos(struct rules_t *obj, int val, int step) {
   return 0;
 }
 
-static int vm_value_src(struct rules_t *obj, int *start, int type) {
-  int x = 0;
-
-  for(x=alignedbytes(*start);alignedbytes(x)<obj->nrbytes;x++) {
-    x = alignedbytes(x);
-    switch(obj->bytecode[x]) {
-      case VINTEGER: {
-        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->bytecode[x];
-        if((obj->bytecode[node->ret]) == type) {
-          (*start) = x + sizeof(struct vm_vinteger_t);
-          return x;
-        }
-        x += sizeof(struct vm_vinteger_t)-1;
-      } break;
-      case VFLOAT: {
-        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->bytecode[x];
-        if((obj->bytecode[node->ret]) == type) {
-          (*start) = x + sizeof(struct vm_vfloat_t);
-          return x;
-        }
-        x += sizeof(struct vm_vfloat_t)-1;
-      } break;
-      /* LCOV_EXCL_START*/
-      default: {
-        fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
-        return -1;
-      } break;
-      /* LCOV_EXCL_STOP*/
-    }
-  }
-  return -1;
-}
-
 static int vm_value_clone(struct rules_t *obj, unsigned char *val) {
-  int ret = obj->nrbytes;
+  int ret = obj->varstack.nrbytes;
 
   switch(val[0]) {
     case VINTEGER: {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vinteger_t))) == NULL) {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vinteger_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
       struct vm_vinteger_t *cpy = (struct vm_vinteger_t *)&val[0];
-      struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->bytecode[obj->nrbytes];
+      struct vm_vinteger_t *value = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
       value->type = VINTEGER;
       value->ret = 0;
       value->value = (int)cpy->value;
-      obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vinteger_t);
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
     } break;
     case VFLOAT: {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vfloat_t))) == NULL) {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vfloat_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
       struct vm_vfloat_t *cpy = (struct vm_vfloat_t *)&val[0];
-      struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->bytecode[obj->nrbytes];
+      struct vm_vfloat_t *value = (struct vm_vfloat_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
       value->type = VFLOAT;
       value->ret = 0;
       value->value = cpy->value;
-      obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vfloat_t);
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
     } break;
     case VNULL: {
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, alignedbytes(obj->nrbytes)+sizeof(struct vm_vnull_t))) == NULL) {
+      unsigned int size = alignedbytes(obj->varstack.nrbytes+sizeof(struct vm_vnull_t));
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
-      struct vm_vnull_t *value = (struct vm_vnull_t *)&obj->bytecode[obj->nrbytes];
+      struct vm_vnull_t *value = (struct vm_vnull_t *)&obj->varstack.buffer[obj->varstack.nrbytes];
       value->type = VNULL;
       value->ret = 0;
-      obj->nrbytes = alignedbytes(obj->nrbytes) + sizeof(struct vm_vnull_t);
+      obj->varstack.nrbytes = size;
+      obj->varstack.bufsize = alignedbuffer(size);
     } break;
     /* LCOV_EXCL_START*/
     default: {
@@ -3155,37 +3268,43 @@ static int vm_value_clone(struct rules_t *obj, unsigned char *val) {
   return ret;
 }
 
-static int vm_value_del(struct rules_t *obj, int idx) {
+static int vm_value_del(struct rules_t *obj, unsigned int idx) {
   int x = 0, ret = 0;
 
-  if(idx == obj->nrbytes) {
+  if(idx == obj->varstack.nrbytes) {
     return -1;
   }
 
-  switch(obj->bytecode[idx]) {
+#ifdef DEBUG
+  printf("%s %d %d\n", __FUNCTION__, __LINE__, idx);
+#endif
+  switch(obj->varstack.buffer[idx]) {
     case VINTEGER: {
-      ret = sizeof(struct vm_vinteger_t);
-      memmove(&obj->bytecode[idx], &obj->bytecode[idx+ret], obj->nrbytes-idx-ret);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes-ret)) == NULL) {
+      ret = alignedbytes(sizeof(struct vm_vinteger_t));
+      memmove(&obj->varstack.buffer[idx], &obj->varstack.buffer[idx+ret], obj->varstack.nrbytes-idx-ret);
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(obj->varstack.nrbytes-ret))) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
-      obj->nrbytes -= ret;
+      obj->varstack.nrbytes -= ret;
+      obj->varstack.bufsize = alignedbuffer(obj->varstack.nrbytes);
     } break;
     case VFLOAT: {
-      ret = sizeof(struct vm_vfloat_t);
-      memmove(&obj->bytecode[idx], &obj->bytecode[idx+ret], obj->nrbytes-idx-ret);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes-ret)) == NULL) {
+      ret = alignedbytes(sizeof(struct vm_vfloat_t));
+      memmove(&obj->varstack.buffer[idx], &obj->varstack.buffer[idx+ret], obj->varstack.nrbytes-idx-ret);
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(obj->varstack.nrbytes-ret))) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
-      obj->nrbytes -= ret;
+      obj->varstack.nrbytes -= ret;
+      obj->varstack.bufsize = alignedbuffer(obj->varstack.nrbytes);
     } break;
     case VNULL: {
-      ret = sizeof(struct vm_vnull_t);
-      memmove(&obj->bytecode[idx], &obj->bytecode[idx+ret], obj->nrbytes-idx-ret);
-      if((obj->bytecode = (unsigned char *)REALLOC(obj->bytecode, obj->nrbytes-ret)) == NULL) {
+      ret = alignedbytes(sizeof(struct vm_vnull_t));
+      memmove(&obj->varstack.buffer[idx], &obj->varstack.buffer[idx+ret], obj->varstack.nrbytes-idx-ret);
+      if((obj->varstack.buffer = (unsigned char *)REALLOC(obj->varstack.buffer, alignedbuffer(obj->varstack.nrbytes-ret))) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
       }
-      obj->nrbytes -= ret;
+      obj->varstack.nrbytes -= ret;
+      obj->varstack.bufsize = alignedbuffer(obj->varstack.nrbytes);
     } break;
     /* LCOV_EXCL_START*/
     default: {
@@ -3201,88 +3320,92 @@ static int vm_value_del(struct rules_t *obj, int idx) {
    * If a value is deleted, these positions changes,
    * so we need to update all nodes.
    */
-  for(x=idx;alignedbytes(x)<obj->nrbytes;x++) {
+  for(x=idx;alignedbytes(x)<obj->varstack.nrbytes;x++) {
     x = alignedbytes(x);
-    switch(obj->bytecode[x]) {
+#ifdef DEBUG
+    printf("%s %d %d\n", __FUNCTION__, __LINE__, x);
+#endif
+    switch(obj->varstack.buffer[x]) {
       case VINTEGER: {
-        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->bytecode[x];
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->varstack.buffer[x];
         if(node->ret > 0) {
           vm_value_upd_pos(obj, x, node->ret);
         }
         x += sizeof(struct vm_vinteger_t)-1;
       } break;
       case VFLOAT: {
-        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->bytecode[x];
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->varstack.buffer[x];
         if(node->ret > 0) {
           vm_value_upd_pos(obj, x, node->ret);
         }
         x += sizeof(struct vm_vfloat_t)-1;
       } break;
       case VNULL: {
-        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[x];
+        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->varstack.buffer[x];
         if(node->ret > 0) {
           vm_value_upd_pos(obj, x, node->ret);
         }
         x += sizeof(struct vm_vnull_t)-1;
       } break;
-/* LCOV_EXCL_START*/
+      /* LCOV_EXCL_START*/
       default: {
         fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
         return -1;
       } break;
-/* LCOV_EXCL_STOP*/
+      /* LCOV_EXCL_STOP*/
     }
   }
+
   return ret;
 }
 
+/*LCOV_EXCL_START*/
 void valprint(struct rules_t *obj, char *out, int size) {
   int x = 0, pos = 0;
   memset(out, 0, size);
   /*
    * This is only used for debugging purposes
    */
-  /*
-  for(x=alignedbytes(obj->pos.vars);alignedbytes(x)<obj->nrbytes;x++) {
-    if(alignedbytes(x) < obj->nrbytes) {
+  for(x=4;alignedbytes(x)<obj->varstack.nrbytes;x++) {
+    if(alignedbytes(x) < obj->varstack.nrbytes) {
       x = alignedbytes(x);
-      switch(obj->bytecode[x]) {
+      switch(obj->varstack.buffer[x]) {
         case VINTEGER: {
-          struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->bytecode[x];
-          switch(obj->bytecode[val->ret]) {
+          struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->varstack.buffer[x];
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %d", &obj->bytecode[node->token+1], val->value);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %d", node->token, val->value);
             } break;
             case TFUNCTION: {
-              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %d", event_functions[obj->bytecode[node->token+1]].name, val->value);
+              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %d", rule_functions[node->token].name, val->value);
             } break;
             case TOPERATOR: {
-              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %d", event_operators[obj->bytecode[node->token+1]].name, val->value);
+              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %d", rule_operators[node->token].name, val->value);
             } break;
             default: {
-              // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->bytecode[val->ret]);
+              // printf("err: %s %d %d\n", __FUNCTION__, __LINE__, obj->ast.buffer[val->ret]);
               // exit(-1);
             } break;
           }
           x += sizeof(struct vm_vinteger_t)-1;
         } break;
         case VFLOAT: {
-          struct vm_vfloat_t *val = (struct vm_vfloat_t *)&obj->bytecode[x];
-          switch(obj->bytecode[val->ret]) {
+          struct vm_vfloat_t *val = (struct vm_vfloat_t *)&obj->varstack.buffer[x];
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %g", &obj->bytecode[node->token+1], val->value);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %g", node->token, val->value);
             } break;
             case TFUNCTION: {
-              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %g", event_functions[obj->bytecode[node->token+1]].name, val->value);
+              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %g", rule_functions[node->token].name, val->value);
             } break;
             case TOPERATOR: {
-              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = %g", event_operators[obj->bytecode[node->token+1]].name, val->value);
+              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = %g", rule_operators[node->token].name, val->value);
             } break;
             default: {
               // printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -3292,19 +3415,19 @@ void valprint(struct rules_t *obj, char *out, int size) {
           x += sizeof(struct vm_vfloat_t)-1;
         } break;
         case VNULL: {
-          struct vm_vnull_t *val = (struct vm_vnull_t *)&obj->bytecode[x];
-          switch(obj->bytecode[val->ret]) {
+          struct vm_vnull_t *val = (struct vm_vnull_t *)&obj->varstack.buffer[x];
+          switch(obj->ast.buffer[val->ret]) {
             case TVAR: {
-              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = NULL", &obj->bytecode[node->token+1]);
+              struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = NULL", node->token);
             } break;
             case TFUNCTION: {
-              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = NULL", event_functions[obj->bytecode[node->token+1]].name);
+              struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = NULL", rule_functions[node->token].name);
             } break;
             case TOPERATOR: {
-              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[val->ret];
-              pos += snprintf(&out[pos], size - pos, "%s = NULL", event_operators[obj->bytecode[node->token+1]].name);
+              struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[val->ret];
+              pos += snprintf(&out[pos], size - pos, "%s = NULL", rule_operators[node->token].name);
             } break;
             default: {
               // printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -3319,23 +3442,19 @@ void valprint(struct rules_t *obj, char *out, int size) {
       }
     }
   }
-  */
+
   if(rule_options.prt_token_val_cb != NULL) {
     rule_options.prt_token_val_cb(obj, out, size);
   }
 }
+/*LCOV_EXCL_START*/
 
 static void vm_clear_values(struct rules_t *obj) {
-  int i = 0, x = 0;
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == 0 && obj->bytecode[i+1] == 0) {
-      x = i+2;
-      break;
-    }
-  }
-  for(i=x;alignedbytes(i)<obj->nrbytes;i++) {
+  int i = 0;
+  for(i=0;alignedbytes(i)<obj->ast.nrbytes;i++) {
+
     i = alignedbytes(i);
-    switch(obj->bytecode[i]) {
+    switch(obj->ast.buffer[i]) {
       case TSTART: {
         i+=sizeof(struct vm_tstart_t)-1;
       } break;
@@ -3349,48 +3468,50 @@ static void vm_clear_values(struct rules_t *obj) {
         i+=sizeof(struct vm_tif_t)-1;
       } break;
       case LPAREN: {
-        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[i];
-        node->value = 0;
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
         i+=sizeof(struct vm_lparen_t)-1;
       } break;
       case TFALSE:
       case TTRUE: {
-        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo);
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TFUNCTION: {
-        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[i];
-        node->value = 0;
-        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo);
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
+        i+=sizeof(struct vm_tfunction_t)+(sizeof(uint16_t)*node->nrgo)-1;
       } break;
       case TCEVENT: {
-        i+=sizeof(struct vm_tcevent_t)-1;
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_tcevent_t)+strlen((char *)node->token);
       } break;
       case TVAR: {
-        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[i];
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[i];
         if(rule_options.clr_token_val_cb != NULL) {
           rule_options.clr_token_val_cb(obj, i);
         } else {
-          node->value = 0;
+          obj->valstack.buffer[node->value] = 0;
         }
-        i+=sizeof(struct vm_tvar_t)-1;
+        i+=sizeof(struct vm_tvar_t)+strlen((char *)node->token);
       } break;
       case TEVENT: {
-        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_tevent_t)-1;
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[i];
+        i += sizeof(struct vm_tevent_t)+strlen((char *)node->token);
       } break;
-      /*
-       * Number is not a seperate node
-       */
-      /*
       case TNUMBER: {
-        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[i];
-        i+=sizeof(struct vm_tnumber_t)-1;
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[i];
+        i+=sizeof(struct vm_tnumber_t)+strlen((char *)node->token);
       } break;
-      */
+      case VINTEGER: {
+        i+=sizeof(struct vm_vinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        i+=sizeof(struct vm_vfloat_t)-1;
+      } break;
       case TOPERATOR: {
-        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[i];
-        node->value = 0;
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[i];
+        obj->valstack.buffer[node->value] = 0;
         i+=sizeof(struct vm_toperator_t)-1;
       } break;
       default: {
@@ -3406,8 +3527,8 @@ int rule_run(struct rules_t *obj, int validate) {
   printf("----------\n");
 #endif
 
-  int go = 0, ret = -1, i = -1, end = -1, start = -1;
-  go = start = obj->pos.parsed;
+  int go = 0, ret = -1, i = -1, start = -1;
+  go = start = 0;
 
   while(go != -1) {
 #ifdef ESP8266
@@ -3416,8 +3537,10 @@ int rule_run(struct rules_t *obj, int validate) {
 
 /*LCOV_EXCL_START*/
 #ifdef DEBUG
-    printf("goto: %d, ret: %d, bytes: %d\n", go, ret, obj->nrbytes);
-    printf("bytecode is %d bytes\n", obj->nrbytes);
+    printf("goto: %d, ret: %d, bytes: %d\n", go, ret, obj->ast.nrbytes);
+    printf("AST stack is   %d bytes, local stack is   %d bytes\n", obj->ast.nrbytes, obj->varstack.nrbytes);
+    printf("AST bufsize is %d bytes, local bufsize is %d bytes\n", obj->ast.bufsize, obj->varstack.bufsize);
+
     {
       char out[1024];
       valprint(obj, (char *)&out, 1024);
@@ -3426,13 +3549,12 @@ int rule_run(struct rules_t *obj, int validate) {
 #endif
 /*LCOV_EXCL_STOP*/
 
-    switch(obj->bytecode[go]) {
+    switch(obj->ast.buffer[go]) {
       case TSTART: {
-        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[go];
+        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[go];
         if(ret > -1) {
           go = -1;
         } else {
-          end = node->ret;
           if(obj->cont.go > 0) {
             go = obj->cont.go;
             ret = obj->cont.ret;
@@ -3445,7 +3567,7 @@ int rule_run(struct rules_t *obj, int validate) {
         }
       } break;
       case TEVENT: {
-        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[go];
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[go];
         if(node->go == ret) {
           ret = go;
           go = node->ret;
@@ -3455,45 +3577,45 @@ int rule_run(struct rules_t *obj, int validate) {
         }
       } break;
       case TIF: {
-        struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[go];
-        int idx = 0, val = -1;
+        struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[go];
+        int val = -1;
         if(ret > -1) {
-          switch(obj->bytecode[ret]) {
+          switch(obj->ast.buffer[ret]) {
             case TOPERATOR: {
-              struct vm_toperator_t *op = (struct vm_toperator_t *)&obj->bytecode[ret];
-              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->bytecode[op->value];
+              struct vm_toperator_t *op = (struct vm_toperator_t *)&obj->ast.buffer[ret];
+              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->valstack.buffer[op->value]];
 
               val = tmp->value;
-              vm_value_del(obj, op->value);
+              vm_value_del(obj, obj->valstack.buffer[op->value]);
 
               /*
                * Reassign node due to various (unsigned char *)REALLOC's
                */
-              node = (struct vm_tif_t *)&obj->bytecode[go];
+              node = (struct vm_tif_t *)&obj->ast.buffer[go];
             } break;
             case LPAREN: {
-              struct vm_lparen_t *op = (struct vm_lparen_t *)&obj->bytecode[ret];
-              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->bytecode[op->value];
+              struct vm_lparen_t *op = (struct vm_lparen_t *)&obj->ast.buffer[ret];
+              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->varstack.buffer[obj->valstack.buffer[op->value]];
 
               val = tmp->value;
-              vm_value_del(obj, op->value);
+              vm_value_del(obj, obj->valstack.buffer[op->value]);
 
               /*
                * Reassign node due to various (unsigned char *)REALLOC's
                */
-              node = (struct vm_tif_t *)&obj->bytecode[go];
+              node = (struct vm_tif_t *)&obj->ast.buffer[go];
             } break;
             case TTRUE:
             case TFALSE:
             case TIF:
             case TEVENT:
             break;
-/* LCOV_EXCL_START*/
+            /* LCOV_EXCL_START*/
             default: {
               fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
               return -1;
             } break;
-/* LCOV_EXCL_STOP*/
+            /* LCOV_EXCL_STOP*/
           }
         }
 
@@ -3524,7 +3646,7 @@ int rule_run(struct rules_t *obj, int validate) {
         }
       } break;
       case TCEVENT: {
-        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->bytecode[go];
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[go];
 
         if(rule_options.event_cb == NULL) {
           /* LCOV_EXCL_START*/
@@ -3539,10 +3661,10 @@ int rule_run(struct rules_t *obj, int validate) {
         /*
          * Tail recursive
          */
-        return rule_options.event_cb(obj, (const char *)&obj->bytecode[node->token+1]);
+        return rule_options.event_cb(obj, (char *)node->token);
       } break;
       case TFUNCTION: {
-        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->bytecode[go];
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
 
         int match = 0, tmp = go;
 
@@ -3550,8 +3672,10 @@ int rule_run(struct rules_t *obj, int validate) {
           if(node->go[i] == ret) {
             match = 1;
             if(i+1 < node->nrgo) {
-              switch(obj->bytecode[node->go[i+1]]) {
-                case TNUMBER: {
+              switch(obj->ast.buffer[node->go[i+1]]) {
+                case TNUMBER:
+                case VINTEGER:
+                case VFLOAT: {
                   ret = go;
                   go = node->go[i+1];
                 } break;
@@ -3587,46 +3711,49 @@ int rule_run(struct rules_t *obj, int validate) {
 
         if(go == 0) {
           go = tmp;
-          int idx = obj->bytecode[node->token+1], c = 0, i = 0, shift = 0;
+          unsigned int idx = node->token, i = 0, shift = 0;
+          int c = 0;
           uint16_t values[node->nrgo];
           memset(&values, 0, node->nrgo);
 
           /* LCOV_EXCL_START*/
-          if(idx > nr_event_functions) {
+          if(idx > nr_rule_functions) {
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
           }
           /* LCOV_EXCL_STOP*/
 
           for(i=0;i<node->nrgo;i++) {
-            switch(obj->bytecode[node->go[i]]) {
-              case TNUMBER: {
+            switch(obj->ast.buffer[node->go[i]]) {
+              case TNUMBER:
+              case VINTEGER:
+              case VFLOAT: {
                 values[i] = vm_value_set(obj, node->go[i], 0);
 
                 /*
                  * Reassign node due to possible reallocs
                  */
-                node = (struct vm_tfunction_t *)&obj->bytecode[go];
+                node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
               } break;
               case LPAREN: {
-                struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->bytecode[node->go[i]];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value];
-                values[i] = tmp->value;
-                tmp->value = 0;
+                struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->ast.buffer[node->go[i]];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value]];
+                values[i] = obj->valstack.buffer[tmp->value];
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = 0;
               } break;
               case TOPERATOR: {
-                struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->bytecode[node->go[i]];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value];
-                values[i] = tmp->value;
-                tmp->value = 0;
+                struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->ast.buffer[node->go[i]];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value]];
+                values[i] = obj->valstack.buffer[tmp->value];
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = 0;
               } break;
               case TFUNCTION: {
-                struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->bytecode[node->go[i]];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value];
-                values[i] = tmp->value;
-                tmp->value = 0;
+                struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->ast.buffer[node->go[i]];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value]];
+                values[i] = obj->valstack.buffer[tmp->value];
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = 0;
               } break;
               case VNULL: {
@@ -3634,7 +3761,7 @@ int rule_run(struct rules_t *obj, int validate) {
                 /*
                 * Reassign node due to possible reallocs
                 */
-                node = (struct vm_tfunction_t *)&obj->bytecode[go];
+                node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
               } break;
               case TVAR: {
                 if(rule_options.get_token_val_cb != NULL && rule_options.cpy_token_val_cb != NULL) {
@@ -3651,7 +3778,7 @@ int rule_run(struct rules_t *obj, int validate) {
                   /*
                    * Reassign node due to possible reallocs
                    */
-                  node = (struct vm_tfunction_t *)&obj->bytecode[go];
+                  node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
                 } else {
                   /* LCOV_EXCL_START*/
                   fprintf(stderr, "FATAL: No '[get|cpy]_token_val_cb' set to handle variables\n");
@@ -3668,9 +3795,9 @@ int rule_run(struct rules_t *obj, int validate) {
             }
           }
 
-          if(event_functions[idx].callback(obj, node->nrgo, values, &c) != 0) {
+          if(rule_functions[idx].callback(obj, node->nrgo, values, &c) != 0) {
             /* LCOV_EXCL_START*/
-            fprintf(stderr, "FATAL: function call '%s' failed\n", event_functions[idx].name);
+            fprintf(stderr, "FATAL: function call '%s' failed\n", rule_functions[idx].name);
             return -1;
             /* LCOV_EXCL_STOP*/
           }
@@ -3678,23 +3805,23 @@ int rule_run(struct rules_t *obj, int validate) {
           /*
            * Reassign node due to possible reallocs
            */
-          node = (struct vm_tfunction_t *)&obj->bytecode[go];
+          node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
           if(c > 0) {
-            switch(obj->bytecode[c]) {
+            switch(obj->varstack.buffer[c]) {
               case VINTEGER: {
-                struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->bytecode[c];
+                struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->varstack.buffer[c];
                 tmp->ret = go;
-                node->value = c;
+                obj->valstack.buffer[node->value] = c;
               } break;
               case VNULL: {
-                struct vm_vnull_t *tmp = (struct vm_vnull_t *)&obj->bytecode[c];
+                struct vm_vnull_t *tmp = (struct vm_vnull_t *)&obj->varstack.buffer[c];
                 tmp->ret = go;
-                node->value = c;
+                obj->valstack.buffer[node->value] = c;
               } break;
               case VFLOAT: {
-                struct vm_vfloat_t *tmp = (struct vm_vfloat_t *)&obj->bytecode[c];
+                struct vm_vfloat_t *tmp = (struct vm_vfloat_t *)&obj->varstack.buffer[c];
                 tmp->ret = go;
-                node->value = c;
+                obj->valstack.buffer[node->value] = c;
               } break;
               /* LCOV_EXCL_START*/
               default: {
@@ -3704,11 +3831,11 @@ int rule_run(struct rules_t *obj, int validate) {
               /* LCOV_EXCL_STOP*/
             }
           } else {
-            node->value = 0;
+            obj->valstack.buffer[node->value] = 0;
           }
 
           for(i=0;i<node->nrgo;i++) {
-            switch(obj->bytecode[values[i] - shift]) {
+            switch(obj->varstack.buffer[values[i] - shift]) {
               case VFLOAT:
               case VNULL:
               case VINTEGER: {
@@ -3717,7 +3844,7 @@ int rule_run(struct rules_t *obj, int validate) {
                 /*
                  * Reassign node due to possible reallocs
                  */
-                node = (struct vm_tfunction_t *)&obj->bytecode[go];
+                node = (struct vm_tfunction_t *)&obj->ast.buffer[go];
               } break;
               /* LCOV_EXCL_START*/
               default: {
@@ -3733,53 +3860,68 @@ int rule_run(struct rules_t *obj, int validate) {
         }
       } break;
       case TOPERATOR: {
-        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[go];
-        int val = -1;
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[go];
 
-        if(node->right == ret || (node->left < start && node->right < start)) {
-          int a = 0, b = 0, c = 0, step = 0, next = 0, out = 0;
+        if(node->right == ret ||
+            (
+              (
+                obj->ast.buffer[node->left] == VFLOAT ||
+                obj->ast.buffer[node->left] == VINTEGER ||
+                obj->ast.buffer[node->left] == TNUMBER
+              ) &&
+              (
+                obj->ast.buffer[node->right] == VFLOAT ||
+                obj->ast.buffer[node->right] == VINTEGER ||
+                obj->ast.buffer[node->right] == TNUMBER
+              )
+            )
+           ) {
+          int a = 0, b = 0, c = 0, step = 0;
           step = node->left;
 
-          switch(obj->bytecode[step]) {
-            case TNUMBER: {
+          switch(obj->ast.buffer[step]) {
+            case TNUMBER:
+            case VFLOAT:
+            case VINTEGER: {
               a = vm_value_set(obj, step, step);
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
             } break;
             case TOPERATOR: {
-              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->bytecode[step];
-              a = tmp->value;
-              tmp->value = 0;
+              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->ast.buffer[step];
+              a = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case LPAREN: {
-              struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->bytecode[step];
-              a = tmp->value;
-              tmp->value = 0;
+              struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->ast.buffer[step];
+              a = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case TFUNCTION: {
-              struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->bytecode[step];
-              a = tmp->value;
-              tmp->value = 0;
+              struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->ast.buffer[step];
+              a = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case VNULL: {
               a = vm_value_set(obj, step, step);
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
             } break;
             case TVAR: {
               /*
                * If vars are seperate steps
                */
-              // struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->bytecode[step];
+              // struct vm_tvar_t *tmp = (struct vm_tvar_t *)&obj->ast.buffer[step];
               // a = tmp->value;
 
               if(rule_options.get_token_val_cb != NULL && rule_options.cpy_token_val_cb != NULL) {
                 rule_options.cpy_token_val_cb(obj, step); // TESTME
                 unsigned char *val = rule_options.get_token_val_cb(obj, step);
+
                 /* LCOV_EXCL_START*/
                 if(val == NULL) {
                   fprintf(stderr, "FATAL: 'get_token_val_cb' did not return a value\n");
@@ -3790,7 +3932,7 @@ int rule_run(struct rules_t *obj, int validate) {
                 /*
                  * Reassign node due to possible reallocs
                  */
-                node = (struct vm_toperator_t *)&obj->bytecode[go];
+                node = (struct vm_toperator_t *)&obj->ast.buffer[go];
               } else {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: No '[get|cpy]_token_val_cb' set to handle variables\n");
@@ -3807,35 +3949,38 @@ int rule_run(struct rules_t *obj, int validate) {
           }
 
           step = node->right;
-          switch(obj->bytecode[step]) {
-            case TNUMBER: {
+
+          switch(obj->ast.buffer[step]) {
+            case TNUMBER:
+            case VFLOAT:
+            case VINTEGER: {
               b = vm_value_set(obj, step, step);
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
             } break;
             case TOPERATOR: {
-              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->bytecode[step];
-              b = tmp->value;
-              tmp->value = 0;
+              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->ast.buffer[step];
+              b = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case LPAREN: {
-              struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->bytecode[step];
-              b = tmp->value;
-              tmp->value = 0;
+              struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->ast.buffer[step];
+              b = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case TFUNCTION: {
-              struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->bytecode[step];
-              b = tmp->value;
-              tmp->value = 0;
+              struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->ast.buffer[step];
+              b = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
             case VNULL: {
               b = vm_value_set(obj, step, step);
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
             } break;
             case TVAR: {
               /*
@@ -3844,6 +3989,7 @@ int rule_run(struct rules_t *obj, int validate) {
               if(rule_options.get_token_val_cb != NULL && rule_options.cpy_token_val_cb != NULL) {
                 rule_options.cpy_token_val_cb(obj, step); // TESTME
                 unsigned char *val = rule_options.get_token_val_cb(obj, step);
+
                 /* LCOV_EXCL_START*/
                 if(val == NULL) {
                   fprintf(stderr, "FATAL: 'get_token_val_cb' did not return a value\n");
@@ -3854,7 +4000,7 @@ int rule_run(struct rules_t *obj, int validate) {
                 /*
                  * Reassign node due to possible reallocs
                  */
-                node = (struct vm_toperator_t *)&obj->bytecode[go];
+                node = (struct vm_toperator_t *)&obj->ast.buffer[go];
               } else {
                 /* LCOV_EXCL_START*/
                 fprintf(stderr, "FATAL: No '[get|cpy]_token_val_cb' set to handle variables\n");
@@ -3869,18 +4015,18 @@ int rule_run(struct rules_t *obj, int validate) {
             } break;
             /* LCOV_EXCL_STOP*/
           }
-          int idx = obj->bytecode[node->token+1];
+          unsigned int idx = node->token;
 
           /* LCOV_EXCL_START*/
-          if(idx > nr_event_operators) {
+          if(idx > nr_rule_operators) {
             fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
             return -1;
           }
           /* LCOV_EXCL_STOP*/
 
-          if(event_operators[idx].callback(obj, a, b, &c) != 0) {
+          if(rule_operators[idx].callback(obj, a, b, &c) != 0) {
             /* LCOV_EXCL_START*/
-            fprintf(stderr, "FATAL: operator call '%s' failed\n", event_operators[idx].name);
+            fprintf(stderr, "FATAL: operator call '%s' failed\n", rule_operators[idx].name);
             return -1;
             /* LCOV_EXCL_STOP*/
           }
@@ -3889,38 +4035,35 @@ int rule_run(struct rules_t *obj, int validate) {
            * Reassign node due to possible (unsigned char *)REALLOC's
            * in the callbacks
            */
-          node = (struct vm_toperator_t *)&obj->bytecode[go];
+          node = (struct vm_toperator_t *)&obj->ast.buffer[go];
 
-          switch(obj->bytecode[c]) {
+          switch(obj->varstack.buffer[c]) {
             case VINTEGER: {
-              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->bytecode[c];
+              struct vm_vinteger_t *tmp = (struct vm_vinteger_t *)&obj->varstack.buffer[c];
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
               tmp->ret = go;
-              node->value = c;
-              out = tmp->value;
+              obj->valstack.buffer[node->value] = c;
             } break;
             case VFLOAT: {
-              struct vm_vfloat_t *tmp = (struct vm_vfloat_t *)&obj->bytecode[c];
+              struct vm_vfloat_t *tmp = (struct vm_vfloat_t *)&obj->varstack.buffer[c];
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
               tmp->ret = go;
-              node->value = c;
-              out = tmp->value;
+              obj->valstack.buffer[node->value] = c;
             } break;
             case VNULL: {
-              struct vm_vnull_t *tmp = (struct vm_vnull_t *)&obj->bytecode[c];
+              struct vm_vnull_t *tmp = (struct vm_vnull_t *)&obj->varstack.buffer[c];
               /*
                * Reassign node due to possible reallocs
                */
-              node = (struct vm_toperator_t *)&obj->bytecode[go];
+              node = (struct vm_toperator_t *)&obj->ast.buffer[go];
               tmp->ret = go;
-              node->value = c;
-              out = 0;
+              obj->valstack.buffer[node->value] = c;
             } break;
             /* LCOV_EXCL_START*/
             default: {
@@ -3935,18 +4078,18 @@ int rule_run(struct rules_t *obj, int validate) {
           /*
            * Reassign node due to possible reallocs
            */
-          node = (struct vm_toperator_t *)&obj->bytecode[go];
+          node = (struct vm_toperator_t *)&obj->ast.buffer[go];
 
           vm_value_del(obj, min(a, b));
 
           /*
            * Reassign node due to possible reallocs
            */
-          node = (struct vm_toperator_t *)&obj->bytecode[go];
+          node = (struct vm_toperator_t *)&obj->ast.buffer[go];
 
           ret = go;
           go = node->ret;
-        } else if(node->left == ret || node->left < obj->pos.parsed) {
+        } else if(node->left == ret/* || node->left < obj->pos.parsed*/) {
           ret = go;
           go = node->right;
         } else {
@@ -3954,7 +4097,9 @@ int rule_run(struct rules_t *obj, int validate) {
           go = node->left;
         }
       } break;
-      case TNUMBER: {
+      case TNUMBER:
+      case VFLOAT:
+      case VINTEGER: {
         int tmp = ret;
         ret = go;
         go = tmp;
@@ -3970,14 +4115,25 @@ int rule_run(struct rules_t *obj, int validate) {
         go = tmp;
       } break;
       case LPAREN: {
-        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[go];
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[go];
         if(node->go == ret) {
-          switch(obj->bytecode[node->go]) {
+          switch(obj->ast.buffer[node->go]) {
             case TOPERATOR: {
-              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->bytecode[ret];
-              node->value = tmp->value;
-              tmp->value = 0;
+              struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->ast.buffer[ret];
+              obj->valstack.buffer[node->value] = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
             } break;
+            case LPAREN: {
+              struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->ast.buffer[ret];
+              obj->valstack.buffer[node->value] = obj->valstack.buffer[tmp->value];
+              obj->valstack.buffer[tmp->value] = 0;
+            } break;
+            /* LCOV_EXCL_START*/
+            default: {
+              fprintf(stderr, "FATAL: Internal error in %s #%d\n", __FUNCTION__, __LINE__);
+              return -1;
+            } break;
+            /* LCOV_EXCL_STOP*/
           }
           ret = go;
           go = node->ret;
@@ -3988,22 +4144,21 @@ int rule_run(struct rules_t *obj, int validate) {
       } break;
       case TFALSE:
       case TTRUE: {
-        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[go];
-        int idx = 0;
-        switch(obj->bytecode[ret]) {
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[go];
+        switch(obj->ast.buffer[ret]) {
           case TVAR: {
           } break;
           // case TOPERATOR: {
-            // struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[ret];
+            // struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[ret];
             // idx = node->value;
             // node->value = 0;
           // } break;
           case TFUNCTION: {
-            struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->bytecode[ret];
-            if(tmp->value > 0) {
-              vm_value_del(obj, tmp->value);
+            struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->ast.buffer[ret];
+            if(obj->valstack.buffer[tmp->value] > 0) {
+              vm_value_del(obj, obj->valstack.buffer[tmp->value]);
             }
-            node = (struct vm_ttrue_t *)&obj->bytecode[go];
+            node = (struct vm_ttrue_t *)&obj->ast.buffer[go];
           } break;
           case TIF:
           case TEVENT:
@@ -4019,13 +4174,13 @@ int rule_run(struct rules_t *obj, int validate) {
           /* LCOV_EXCL_STOP*/
         }
 
-        // if((obj->bytecode[ret]) == TOPERATOR) {
+        // if((obj->ast.buffer[ret]) == TOPERATOR) {
           // vm_value_del(obj, idx);
 
           // /*
            // * Reassign node due to various (unsigned char *)REALLOC's
            // */
-          // node = (struct vm_ttrue_t *)&obj->bytecode[go];
+          // node = (struct vm_ttrue_t *)&obj->ast.buffer[go];
         // }
 
         int match = 0, tmp = go;
@@ -4043,7 +4198,7 @@ int rule_run(struct rules_t *obj, int validate) {
           }
         }
         if(match == 0) {
-          ret = node->ret;
+          ret = go;
           go = node->go[0];
         }
 
@@ -4053,13 +4208,9 @@ int rule_run(struct rules_t *obj, int validate) {
         }
       } break;
       case TVAR: {
-        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[go];
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[go];
 
-        if(go < obj->pos.parsed) {
-          int tmp = ret;
-          ret = go;
-          go = tmp;
-        } else if(node->go == 0) {
+        if(node->go == 0) {
           if(rule_options.cpy_token_val_cb != NULL) {
             rule_options.cpy_token_val_cb(obj, go);
           }
@@ -4067,48 +4218,50 @@ int rule_run(struct rules_t *obj, int validate) {
           /*
            * Reassign node due to various (unsigned char *)REALLOC's
            */
-          node = (struct vm_tvar_t *)&obj->bytecode[go];
+          node = (struct vm_tvar_t *)&obj->ast.buffer[go];
 
           ret = go;
           go = node->ret;
-        } else if(go > obj->pos.parsed) {
+        } else {
           /*
            * When we can find the value in the
            * prepared rule and not as a separate
            * node.
            */
-          if(node->go < obj->pos.parsed || node->go == ret) {
-            int idx = 0, start = end+1, shift = 0;
+          if(node->go == ret) {
+            int idx = 0, shift = 0;
 
-            switch(obj->bytecode[node->go]) {
+            switch(obj->ast.buffer[node->go]) {
               case TOPERATOR: {
-                struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->bytecode[ret];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value];
-                idx = tmp->value;
-
-                tmp->value = 0;
+                struct vm_toperator_t *tmp = (struct vm_toperator_t *)&obj->ast.buffer[ret];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value]];
+                idx = obj->valstack.buffer[tmp->value];
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = go;
               } break;
               case TFUNCTION: {
-                struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->bytecode[ret];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value];
-                idx = tmp->value;
-                tmp->value = 0;
+                struct vm_tfunction_t *tmp = (struct vm_tfunction_t *)&obj->ast.buffer[ret];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value]];
+                idx = obj->valstack.buffer[tmp->value];
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = go;
               } break;
-              case TNUMBER: {
+              case TNUMBER:
+              case VFLOAT:
+              case VINTEGER: {
                 idx = vm_value_set(obj, node->go, go);
+
                 /*
                  * Reassign node due to various (unsigned char *)REALLOC's
                  */
-                node = (struct vm_tvar_t *)&obj->bytecode[go];
+                node = (struct vm_tvar_t *)&obj->ast.buffer[go];
               } break;
               case VNULL: {
                 idx = vm_value_set(obj, node->go, go);
                 /*
                  * Reassign node due to various (unsigned char *)REALLOC's
                  */
-                node = (struct vm_tvar_t *)&obj->bytecode[go];
+                node = (struct vm_tvar_t *)&obj->ast.buffer[go];
               } break;
               /*
                * Clone variable value to new variable
@@ -4133,13 +4286,13 @@ int rule_run(struct rules_t *obj, int validate) {
                 /*
                  * Reassign node due to possible reallocs
                  */
-                node = (struct vm_tvar_t *)&obj->bytecode[go];
+                node = (struct vm_tvar_t *)&obj->ast.buffer[go];
               } break;
               case LPAREN: {
-                struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->bytecode[ret];
-                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->bytecode[tmp->value - shift];
-                idx = tmp->value - shift;
-                tmp->value = 0;
+                struct vm_lparen_t *tmp = (struct vm_lparen_t *)&obj->ast.buffer[ret];
+                struct vm_tgeneric_t *val = (struct vm_tgeneric_t *)&obj->varstack.buffer[obj->valstack.buffer[tmp->value] - shift];
+                idx = obj->valstack.buffer[tmp->value] - shift;
+                obj->valstack.buffer[tmp->value] = 0;
                 val->ret = go;
               } break;
               /* LCOV_EXCL_START*/
@@ -4161,12 +4314,13 @@ int rule_run(struct rules_t *obj, int validate) {
               rule_options.set_token_val_cb(obj, go, idx);
 
               vm_value_del(obj, idx);
+
               /*
                * Reassign node due to various (unsigned char *)REALLOC's
                */
-              node = (struct vm_tvar_t *)&obj->bytecode[go];
+              node = (struct vm_tvar_t *)&obj->ast.buffer[go];
             } else {
-              node->value = 0;
+              obj->valstack.buffer[node->value] = 0;
             }
 
             ret = go;
@@ -4193,149 +4347,163 @@ int rule_run(struct rules_t *obj, int validate) {
 /*LCOV_EXCL_START*/
 #ifdef DEBUG
 void print_bytecode(struct rules_t *obj) {
-  int step = 0, i = 0;
-  for(i=0;i<obj->nrbytes;i++) {
-    if(obj->bytecode[i] == 0 && obj->bytecode[i+1] == 0) {
-      printf(". . ");
-      i+=2;
-      step = 1;
-    }
-    if(i == obj->nrbytes) {
-      printf("\n");
-    }
-    if(step == 0) {
-      if(obj->bytecode[i] == TIF || obj->bytecode[i] == TTHEN ||
-         obj->bytecode[i] == TEND || obj->bytecode[i] == TASSIGN ||
-         obj->bytecode[i] == TELSE || obj->bytecode[i] == TSEMICOLON ||
-         obj->bytecode[i] == TEND || obj->bytecode[i] == TSTART ||
-         obj->bytecode[i] == LPAREN || obj->bytecode[i] == RPAREN ||
-         obj->bytecode[i] == TCOMMA || obj->bytecode[i] == VNULL ||
-         obj->bytecode[i] == TEOF) {
-        printf("%d ", obj->bytecode[i]);
-      } else if(obj->bytecode[i] == TOPERATOR) {
-        printf("%d ", obj->bytecode[i]);
-        printf("%d ", obj->bytecode[++i]);
-      } else if(obj->bytecode[i] == TFUNCTION) {
-        printf("%d ", obj->bytecode[i]);
-        printf("%d ", obj->bytecode[++i]);
-      } else if(obj->bytecode[i] == TVAR ||
-                obj->bytecode[i] == TNUMBER ||
-                obj->bytecode[i] == TSTRING ||
-                obj->bytecode[i] == TCEVENT ||
-                obj->bytecode[i] == TEVENT) {
-        printf("%d ", obj->bytecode[i]);
-        while(obj->bytecode[i] != 0) {
-          printf("%c", obj->bytecode[++i]);
-        }
-        printf(". ");
-      } else {
-        printf(".");
-      }
-    } else if(i < obj->nrbytes) {
-      switch(obj->bytecode[i]) {
-        case TIF: {
-          struct vm_tif_t *node = (struct vm_tif_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->go);
-          printf("%d ", node->true_);
-          printf("%d ", node->false_);
-          i += sizeof(struct vm_tif_t)-1;
-        } break;
-        case LPAREN: {
-          struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->go);
-          printf("%d ", node->value);
-          i += sizeof(struct vm_lparen_t)-1;
-        } break;
-        case TVAR: {
-          struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->token);
-          printf("%d ", node->go);
-          printf("%d ", node->value);
-          i += sizeof(struct vm_tvar_t)-1;
-        } break;
-        case TEVENT: {
-          struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->token);
-          printf("%d ", node->go);
-          i += sizeof(struct vm_tevent_t)-1;
-        } break;
-        case TCEVENT: {
-          struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->token);
-          i += sizeof(struct vm_tevent_t)-1;
-        } break;
-        case TSTART: {
-          struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->go);
-          i += sizeof(struct vm_tstart_t)-1;
-        } break;
-        case TNUMBER: {
-          struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->token);
-          i += sizeof(struct vm_tnumber_t)-1;
-        } break;
-        case TFALSE:
-        case TTRUE: {
-          struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->nrgo);
-          int x = 0;
-          for(x=0;x<node->nrgo;x++) {
-            printf("%d ", node->go[x]);
+  unsigned int i = 0;
+
+  for(i=0;i<obj->ast.nrbytes;i++) {
+    i = alignedbytes(i);
+    printf("%d", i);
+    switch(obj->ast.buffer[i]) {
+      case TIF: {
+        struct vm_tif_t *node = (struct vm_tif_t *)&obj->ast.buffer[i];
+        printf("(TIF)[9][");
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("go: %d, ", node->go);
+        printf("true_: %d, ", node->true_);
+        printf("false: %d]\n", node->false_);
+        i += sizeof(struct vm_tif_t)-1;
+      } break;
+      case LPAREN: {
+        struct vm_lparen_t *node = (struct vm_lparen_t *)&obj->ast.buffer[i];
+        printf("(LPAREN)[7][");
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("go: %d, ", node->go);
+        printf("value: %d]\n", obj->valstack.buffer[node->value]);
+        i += sizeof(struct vm_lparen_t)-1;
+      } break;
+      case TVAR: {
+        struct vm_tvar_t *node = (struct vm_tvar_t *)&obj->ast.buffer[i];
+        printf("(TVAR)[%lu][", 7+strlen((char *)node->token)+1);
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("go: %d, ", node->go);
+        printf("value: %d, ", obj->valstack.buffer[node->value]);
+        printf("token: %s]\n", node->token);
+        i += sizeof(struct vm_tvar_t)+strlen((char *)node->token);
+      } break;
+      case TEVENT: {
+        struct vm_tevent_t *node = (struct vm_tevent_t *)&obj->ast.buffer[i];
+        printf("(TEVENT)[%lu][", 5+strlen((char *)node->token)+1);
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("go: %d, ", node->go);
+        printf("token: %s]\n", node->token);
+        i += sizeof(struct vm_tevent_t)+strlen((char *)node->token);
+      } break;
+      case TCEVENT: {
+        struct vm_tcevent_t *node = (struct vm_tcevent_t *)&obj->ast.buffer[i];
+        printf("(TCEVENT)[%lu][", 3+strlen((char *)node->token)+1);
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("token: %s]\n", node->token);
+        i += sizeof(struct vm_tcevent_t)+strlen((char *)node->token);
+      } break;
+      case TSTART: {
+        struct vm_tstart_t *node = (struct vm_tstart_t *)&obj->ast.buffer[i];
+        printf("(TSTART)[5][");
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("go: %d]\n", node->go);
+        i += sizeof(struct vm_tstart_t)-1;
+      } break;
+      /* LCOV_EXCL_START*/
+      case TNUMBER: {
+        struct vm_tnumber_t *node = (struct vm_tnumber_t *)&obj->ast.buffer[i];
+        printf("(TNUMBER)[%lu][", 3+strlen((char *)node->token)+1);
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("token: %s]\n", node->token);
+        i += sizeof(struct vm_tnumber_t)+strlen((char *)node->token);
+      } break;
+      /* LCOV_EXCL_STOP*/
+      case VINTEGER: {
+        struct vm_vinteger_t *node = (struct vm_vinteger_t *)&obj->ast.buffer[i];
+        printf("(VINTEGER)[%lu][", sizeof(struct vm_vinteger_t));
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("value: %d]\n", node->value);
+        i += sizeof(struct vm_vinteger_t)-1;
+      } break;
+      case VFLOAT: {
+        struct vm_vfloat_t *node = (struct vm_vfloat_t *)&obj->ast.buffer[i];
+        printf("(VFLOAT)[%lu][", sizeof(struct vm_vfloat_t));
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("value: %g]\n", node->value);
+        i += sizeof(struct vm_vfloat_t)-1;
+      } break;
+      case TFALSE:
+      case TTRUE: {
+        struct vm_ttrue_t *node = (struct vm_ttrue_t *)&obj->ast.buffer[i];
+        printf("(TTRUE)[%lu][", 4+(node->nrgo*sizeof(node->go[0])));
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("nrgo: %d, ", node->nrgo);
+        printf("go[");
+        int x = 0;
+        for(x=0;x<node->nrgo;x++) {
+          printf("%d: %d", x, node->go[x]);
+          if(node->nrgo-1 > x) {
+            printf(", ");
           }
-          i += sizeof(struct vm_ttrue_t)+(sizeof(uint16_t)*node->nrgo);
-        } break;
-        case TOPERATOR: {
-          struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          printf("%d ", node->left);
-          printf("%d ", node->right);
-          printf("%d ", node->value);
-          i += sizeof(struct vm_toperator_t)-1;
-        } break;
-        case TEOF: {
-          struct vm_teof_t *node = (struct vm_teof_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          i += sizeof(struct vm_teof_t)-1;
-        } break;
-        case VNULL: {
-          struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->bytecode[i];
-          printf("%d ", node->type);
-          printf("%d ", node->ret);
-          i += sizeof(struct vm_vnull_t)-1;
-        } break;
-        default: {
-          printf(". ");
         }
-      }
+        printf("]]\n");
+        i += sizeof(struct vm_ttrue_t)+(sizeof(node->go[0])*node->nrgo)-1;
+      } break;
+      case TFUNCTION: {
+        struct vm_tfunction_t *node = (struct vm_tfunction_t *)&obj->ast.buffer[i];
+        printf("(TFUNCTION)[%lu][", 8+(node->nrgo*sizeof(node->go[0])));
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("token: %d, ", node->token);
+        printf("value: %d, ", obj->valstack.buffer[node->value]);
+        printf("nrgo: %d, ", node->nrgo);
+        printf("go[");
+        int x = 0;
+        for(x=0;x<node->nrgo;x++) {
+          printf("%d: %d", x, node->go[x]);
+          if(node->nrgo-1 > x) {
+            printf(", ");
+          }
+        }
+        printf("]]\n");
+        i += sizeof(struct vm_tfunction_t)+(sizeof(node->go[0])*node->nrgo)-1;
+      } break;
+      case TOPERATOR: {
+        struct vm_toperator_t *node = (struct vm_toperator_t *)&obj->ast.buffer[i];
+        printf("(TOPERATOR)[10][");
+        printf("type: %d, ", node->type);
+        printf("ret: %d, ", node->ret);
+        printf("token: %d, ", node->token);
+        printf("left: %d, ", node->left);
+        printf("right: %d, ", node->right);
+        printf("value: %d]\n", obj->valstack.buffer[node->value]);
+        i += sizeof(struct vm_toperator_t)-1;
+      } break;
+      case TEOF: {
+        struct vm_teof_t *node = (struct vm_teof_t *)&obj->ast.buffer[i];
+        printf("(TEOF)[1][type: %d]\n", node->type);
+        i += sizeof(struct vm_teof_t)-1;
+      } break;
+      case VNULL: {
+        struct vm_vnull_t *node = (struct vm_vnull_t *)&obj->ast.buffer[i];
+        printf("(VNULL)[3][");
+        printf("type: %d, ", node->type);
+        printf("ret: %d]\n", node->ret);
+        i += sizeof(struct vm_vnull_t)-1;
+      } break;
     }
   }
 }
 #endif
 /*LCOV_EXCL_STOP*/
 
-int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nrrules, void *userdata) {
-  int len = strlen(text);
-  if(*pos >= len) {
+int rule_initialize(char **text, struct rules_t ***rules, int *nrrules, void *userdata) {
+  unsigned int nrbytes = 0, nrval = 0, len = strlen(*text), newlen = len;
+  if(len == 0) {
     return 1;
   }
-
   *rules = (struct rules_t **)REALLOC(*rules, sizeof(struct rules_t *)*((*nrrules)+1));
   if(*rules == NULL) {
     OUT_OF_MEMORY
@@ -4350,7 +4518,12 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
   obj->nr = (*nrrules)+1;
   (*nrrules)++;
 
-  obj->nrbytes = 0;
+  obj->ast.nrbytes = 0;
+  obj->ast.bufsize = 0;
+  obj->varstack.nrbytes = 4;
+  obj->varstack.bufsize = 4;
+  obj->valstack.bufsize = 0;
+
 /*LCOV_EXCL_START*/
 #if defined(DEBUG) or defined(ESP8266)
   #ifdef ESP8266
@@ -4361,7 +4534,7 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
 #endif
 /*LCOV_EXCL_STOP*/
 
-  if(rule_prepare(text, pos, obj) == -1) {
+  if(rule_prepare(text, &nrbytes, &nrval, &newlen) == -1) {
     return -1;
   }
 
@@ -4394,8 +4567,40 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
 #endif
 /*LCOV_EXCL_STOP*/
 
-  if(rule_parse(obj) == -1) {
-    return -1;
+  {
+    obj->ast.bufsize = alignedbuffer(nrbytes);
+    obj->valstack.bufsize = nrval;
+    if((obj->ast.buffer = (unsigned char *)MALLOC(obj->ast.bufsize)) == NULL) {
+      OUT_OF_MEMORY
+    }
+    if((obj->valstack.buffer = (uint16_t *)MALLOC(nrval*(sizeof(uint16_t)))) == NULL) {
+      OUT_OF_MEMORY
+    }
+    memset(obj->ast.buffer, 0, obj->ast.bufsize);
+    memset(obj->valstack.buffer, 0, nrval*(sizeof(uint16_t)));
+
+    if(rule_parse(text, (int *)&newlen, obj) == -1) {
+      return -1;
+    }
+
+    memmove(&(*text)[0], &(*text)[newlen], len-newlen);
+    (*text)[len-newlen] = 0;
+
+    if((*text)[0] == 0 && len > newlen) {
+      len = strlen(&(*text)[1]);
+      memmove(&(*text)[0], &(*text)[1], len);
+      if((*text = (char *)REALLOC(*text, len+1)) == NULL) {
+        OUT_OF_MEMORY
+      }
+      (*text)[len] = 0;
+    }
+  }
+
+  {
+    int i = 0;
+    for(i=0;i<obj->valstack.bufsize;i++) {
+      obj->valstack.buffer[i] = 0;
+    }
   }
 
 /*LCOV_EXCL_START*/
@@ -4408,7 +4613,11 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
   Serial.println(out);
 
   memset(&out, 0, 1024);
-  snprintf((char *)&out, 1024, "bytecode is %d bytes", obj->nrbytes);
+  snprintf((char *)&out, 1024, "bytecode is %d bytes", obj->ast.nrbytes);
+  Serial.println(out);
+
+  memset(&out, 0, 1024);
+  snprintf((char *)&out, 1024, "valstack is %d bytes", obj->valstack.bufsize);
   Serial.println(out);
   #else
   clock_gettime(CLOCK_MONOTONIC, &obj->timestamp.second);
@@ -4417,7 +4626,9 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
     ((double)obj->timestamp.second.tv_sec + 1.0e-9*obj->timestamp.second.tv_nsec) -
     ((double)obj->timestamp.first.tv_sec + 1.0e-9*obj->timestamp.first.tv_nsec));
 
-  printf("bytecode is %d bytes\n", obj->nrbytes);
+  printf("bytecode is %d bytes\n", obj->ast.nrbytes);
+
+  printf("valstack is %d bytes\n", obj->valstack.bufsize);
   #endif
 #endif
 /*LCOV_EXCL_STOP*/
@@ -4456,7 +4667,7 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
     Serial.println(out);
 
     memset(&out, 0, 1024);
-    snprintf((char *)&out, 1024, "bytecode is %d bytes", obj->nrbytes);
+    snprintf((char *)&out, 1024, "bytecode is %d bytes", obj->ast.nrbytes);
     Serial.println(out);
   #else
     clock_gettime(CLOCK_MONOTONIC, &obj->timestamp.second);
@@ -4465,7 +4676,7 @@ int rule_initialize(const char *text, int *pos, struct rules_t ***rules, int *nr
       ((double)obj->timestamp.second.tv_sec + 1.0e-9*obj->timestamp.second.tv_nsec) -
       ((double)obj->timestamp.first.tv_sec + 1.0e-9*obj->timestamp.first.tv_nsec));
 
-    printf("bytecode is %d bytes\n", obj->nrbytes);
+    printf("bytecode is %d bytes\n", obj->ast.nrbytes);
   #endif
 #endif
 /*LCOV_EXCL_STOP*/

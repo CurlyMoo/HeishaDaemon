@@ -30,15 +30,15 @@
 #include "max.h"
 #include "min.h"
 #include "coalesce.h"
-#include "settimer.h"
 #include "round.h"
+#include "settimer.h"
 
-struct event_function_t event_functions[] = {
+struct rule_function_t rule_functions[] = {
   { "max", event_function_max_callback },
   { "min", event_function_min_callback },
   { "coalesce", event_function_coalesce_callback },
+  { "round", event_function_round_callback },
   { "setTimer", event_function_set_timer_callback },
-  { "round", event_function_round_callback }
 };
 
-int nr_event_functions = sizeof(event_functions)/sizeof(event_functions[0]);
+int nr_rule_functions = sizeof(rule_functions)/sizeof(rule_functions[0]);

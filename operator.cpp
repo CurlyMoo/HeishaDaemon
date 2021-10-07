@@ -41,7 +41,7 @@
 #include "power.h"
 #include "minus.h"
 
-struct event_operator_t event_operators[] = {
+struct rule_operator_t rule_operators[] = {
   { "==", 30, 1, event_operator_eq_callback },
   { "!=", 30, 1, event_operator_ne_callback },
   { "+", 60, 1, event_operator_plus_callback },
@@ -58,4 +58,4 @@ struct event_operator_t event_operators[] = {
   { "^", 80, 2, event_operator_power_callback },
 };
 
-int nr_event_operators = sizeof(event_operators)/sizeof(event_operators[0]);
+int nr_rule_operators = sizeof(rule_operators)/sizeof(rule_operators[0]);

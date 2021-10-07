@@ -9,12 +9,15 @@
 #ifndef _MEM_H_
 #define _MEM_H_
 
+unsigned int alignedbytes(int v);
+unsigned int alignedbuffer(int v);
+
 #define OUT_OF_MEMORY while(0) { }
 
 #define STRDUP strdup
 #define REALLOC realloc
 #define CALLOC calloc
 #define MALLOC malloc
-#define FREE free
+#define FREE(a) do { free(a); (a) = NULL; } while(0)
 
 #endif

@@ -13,5 +13,6 @@
 #include "rules.h"
 
 int event_function_set_timer_callback(struct rules_t *obj, uint16_t argc, uint16_t *argv, int *ret);
+void inline timer_cb(void);
 
 #endif

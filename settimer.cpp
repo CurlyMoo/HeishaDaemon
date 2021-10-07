@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "function.h"
 #include "mem.h"
@@ -28,22 +29,22 @@ int event_function_set_timer_callback(struct rules_t *obj, uint16_t argc, uint16
   if(argc != 2) {
     return -1;
   }
-  
-  if(obj->bytecode[argv[0]] != VINTEGER) {
+
+  if(obj->varstack.buffer[argv[0]] != VINTEGER) {
     return -1;
   }
-  if(obj->bytecode[argv[1]] != VINTEGER) {
+  if(obj->varstack.buffer[argv[1]] != VINTEGER) {
     return -1;
   }
 
-  struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->bytecode[argv[0]];
+  struct vm_vinteger_t *val = (struct vm_vinteger_t *)&obj->varstack.buffer[argv[0]];
   nr = val->value;
 
-  val = (struct vm_vinteger_t *)&obj->bytecode[argv[1]];
+  val = (struct vm_vinteger_t *)&obj->varstack.buffer[argv[1]];
 
   timerqueue_insert(val->value, 0, nr);
 
-  // printf("\n\n%s set timer #%d to %d seconds\n\n", __FUNCTION__, nr, val->value);
+  printf("\n\n%s set timer #%d to %d seconds\n\n", __FUNCTION__, nr, val->value);
 
   if((node = timerqueue_peek()) != NULL) {
     it_val.it_value.tv_sec = node->sec;

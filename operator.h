@@ -11,14 +11,14 @@
 
 #include "rules.h" /* rewrite */
 
-struct event_operator_t {
+struct rule_operator_t {
   const char *name;
   int precedence;
   int associativity;
   int (*callback)(struct rules_t *obj, int a, int b, int *ret);
 } __attribute__((packed));
 
-extern struct event_operator_t event_operators[];
-extern int nr_event_operators;
+extern struct rule_operator_t rule_operators[];
+extern int nr_rule_operators;
 
 #endif
