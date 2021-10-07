@@ -323,7 +323,7 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
           // struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
           // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
           // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-
+          
           // x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
         // } break;
         // case VNULL: {
@@ -1190,7 +1190,6 @@ void handle_alarm(int sig){
     if((node = timerqueue_peek()) != NULL) {
       if(node->sec <= 0 && node->usec <= 0) {
         handle_alarm(0);
-        return;
       }
       it_val.it_value.tv_sec = node->sec;
       it_val.it_value.tv_usec = node->usec;
@@ -1390,9 +1389,9 @@ int main(int argc, char **argv) {
   mosquitto_lib_init();
 
   if((mosq = mosquitto_new("HeishaDaemon3", true, NULL)) == NULL) {
-    OUT_OF_MEMORY
-  }
-
+		OUT_OF_MEMORY
+	}
+  
   mosquitto_log_callback_set(mosq, mosq_log_callback);
   mosquitto_connect_callback_set(mosq, connect_callback);
   mosquitto_message_callback_set(mosq, message_callback);

@@ -5,17 +5,28 @@ on System#Boot then
 	#newTargetTemp = 0;
 	#maxTa = 0;
 	#defrost = 0;
+
+	setTimer(2, 60);
 end
 
 on setThermostaat then
-	#nachtverlaging = coalesce(#nachtverlaging, -2);
-	#T1 = 21.25;
-	#T2 = 20.25;
+	#nachtverlaging = -2;
+	#zomerverlaging = 0;
+	#T1 = 20.75;
+	#T2 = 19.75;
 
-	if @Outside_Temp >= 0 && (%hour <= 6 || %hour >= 22) && #nachtverlaging != 0 then
+	if @Outside_Temp >= 0 && (%hour <= 6 || %hour >= 22) then
 		#T1 = #T1 + #nachtverlaging;
 		#T2 = #T2 + #nachtverlaging;
 		#nachtverlaging = 0;
+		#zomerverlaging = 0;
+	else
+		if %month >= 4 && %month <= 10 then
+			#T1 = #T1 + #zomerverlaging;
+			#T2 = #T2 + #zomerverlaging;
+			#nachtverlaging = 0;
+			#zomerverlaging = 0;
+		end
 	end
 	if @Outside_Temp <= 2 && #nachtverlaging != 0 then
 		#T1 = #T1 + 0.5;
@@ -23,22 +34,26 @@ on setThermostaat then
 end
 
 on stooklijn then
+	$diff = 0;
 	if #targetTempDiff <= 0.25 then
-		#maxTa = #maxTa - 6;
+		$diff = 6;
 	else
 		if #targetTempDiff <= 0.5 then
-			#maxTa = #maxTa - 4;
+			$diff = 4;
 		else
 			if #targetTempDiff <= 1 then
-				#maxTa = #maxTa - 2;
+				$diff = 2;
 			end
 		end
+	end
+	if (#maxTa - $diff) > #Taanvoer1 then
+		#maxTa = #maxTa - $diff;
 	end
 end
 
 on berekenWar then
-	#Taanvoer1 = 34;
-	$Tbuiten1 = 9;
+	#Taanvoer1 = 33;
+	$Tbuiten1 = 10;
 	$Taanvoer2 = 41;
 	$Tbuiten2 = -6;
 
@@ -64,7 +79,7 @@ on setNewTemp then
 	if #newTargetTemp > #maxTa then
 		#newTargetTemp = #maxTa;
 	end
-	if #onTemp == 3 then
+	if #onTemp == 3 && #outletOnTemp == 1 then
 		if #newTargetTemp < #maxTa then
 			#newTargetTemp = #maxTa - 1;
 		end
@@ -88,7 +103,9 @@ on @Defrosting_State then
 	if @Defrosting_State == 1 then
 		#defrost = 1;
 	else
-		setTimer(1, 60);
+		if #defrost == 1 then
+			setTimer(1, 60);
+		end
 	end
 end
 
@@ -113,6 +130,7 @@ on schakelWP then
 		WPAan();
 	end
 
+	resetTeller();
 	resetDummy();
 end
 
@@ -204,11 +222,21 @@ on setTimers then
 	end
 end
 
+on setOnTemp then
+	if @Heatpump_State == 1 then
+		#onTemp = coalesce(#onTemp, 0) + 1;
+		if #onTemp > 3 then
+			#onTemp = 3;
+			if #dTOffset > 0 then
+				#dTOffset = -1;
+			end
+		end
+	end
+end
+
 on @Room_Thermostat_Temp then
 
 	setThermostaat();
-
-	#Teller = coalesce(#Teller, 0) + 1;
 
 	$Temp = @Room_Thermostat_Temp;
 
@@ -220,10 +248,10 @@ on @Room_Thermostat_Temp then
 			if #tellerUit > 5 then
 				#WPAan = 0;
 				#WPUit = 1;
-				resetTeller();
 				schakelWP();
 			end
 		end
+		setOnTemp();
 	else
 		if $Temp < #T2 then
 			#onTemp = 0;
@@ -232,20 +260,11 @@ on @Room_Thermostat_Temp then
 				if #tellerAan > 5 || @Outside_Temp <= 2 then
 					#WPAan = 1;
 					#WPUit = 0;
-					resetTeller();
 					schakelWP();
 				end
 			end
 		else
-			if @Heatpump_State == 1 then
-				#onTemp = coalesce(#onTemp, 0) + 1;
-				if #onTemp > 3 then
-					#onTemp = 3;
-					if #dTOffset > 0 then
-						#dTOffset = -1;
-					end
-				end
-			end
+			setOnTemp();
 			resetDummy();
 		end
 	end
@@ -262,36 +281,50 @@ on @Room_Thermostat_Temp then
 			end
 		end
 
-		if #onTemp == 3 then
-			if #dTOffset > 0 then
-				#dTOffset = -1;
-			end
-			if #defrost == 0 && #Teller >= 2 then
-				if #dTOffset == -2 then
-					#dTOffset = -1;
-				else
-					#dTOffset = -2;
-				end
-				#newTargetTemp = @Main_Outlet_Temp + #dTOffset;
-			end
-		end		
-
 		berekenWar();
 		setNewTemp();
 		setTimers();
 	end
 
 	if $Temp < #T2 then
-		if #dTOffset == -2 then
+		if #dTOffset <= -2 then
 			#dTOffset = -1;
 		end
-	end
-
-	if #Teller == 2 then
-		#Teller = 1;
 	end
 end
 
 on timer=1 then
 	#defrost = 0;
+end
+
+on timer=2 then
+	#Teller = coalesce(#Teller, 0) + 1;
+
+	if #onTemp == 3 then
+		if #dTOffset > 0 then
+			#dTOffset = -1;
+		end
+		if #defrost == 0 && #Teller >= 2 then
+			if #dTOffset <= -2 then
+				#dTOffset = -1;
+			else
+				#dTOffset = -2;
+			end
+			#newTargetTemp = @Main_Outlet_Temp + #dTOffset;
+		end
+
+		if coalesce(#outletOnTemp, 0) == 0 then
+			#dTOffset = -1;
+		end
+
+		berekenWar();
+		setNewTemp();
+		setTimers();
+	end
+
+	if #Teller >= 3 then
+		#Teller = 1;
+	end
+
+	setTimer(2, 60);
 end
