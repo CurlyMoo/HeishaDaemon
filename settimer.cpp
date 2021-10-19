@@ -46,12 +46,5 @@ int event_function_set_timer_callback(struct rules_t *obj, uint16_t argc, uint16
 
   printf("\n\n%s set timer #%d to %d seconds\n\n", __FUNCTION__, nr, val->value);
 
-  if((node = timerqueue_peek()) != NULL) {
-    it_val.it_value.tv_sec = node->sec;
-    it_val.it_value.tv_usec = node->usec;  
-    it_val.it_interval = it_val.it_value;
-    setitimer(ITIMER_REAL, &it_val, NULL);
-  }
-
   return 0;
 }

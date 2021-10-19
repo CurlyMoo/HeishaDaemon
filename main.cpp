@@ -15,6 +15,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <mosquitto.h>
 #include <math.h>
 #include <string.h>
@@ -323,7 +325,7 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
           // struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
           // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
           // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-          
+
           // x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
         // } break;
         // case VNULL: {
@@ -613,6 +615,59 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
   }
 
   return ret;
+}
+
+static int http_request(char *name, char *value) {
+  char buffer[1024] = {0};
+	struct sockaddr_in serv_addr;
+
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	memset(&serv_addr, '0', sizeof(serv_addr));
+
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = htons(80);
+  inet_pton(AF_INET, "10.0.2.124", &serv_addr.sin_addr);
+
+  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    fprintf(stderr, "failed to connect to server\n");
+    return -1;
+  }
+
+  struct timeval timeout;
+  timeout.tv_sec = 10;
+  timeout.tv_usec = 0;
+
+  if(setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+    fprintf(stderr, "setsockopt failed\n");
+    return -1;
+  }
+
+  if(setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+    fprintf(stderr, "setsockopt failed\n");
+    return -1;
+  }
+
+  unsigned int len = snprintf(buffer, 1024,
+    "GET /command?%s=%s HTTP/1.0\r\n"
+    "Host: 10.0.2.124\r\n"
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0\r\n"
+    "\r\n", name, value);
+
+  if(send(sockfd, buffer, len, 0) != len) {
+    fprintf(stderr, "failed send message");
+    return -1;
+  }
+
+  memset(&buffer, 0, 1024);
+
+  while((len = read(sockfd, &buffer, 1024)) > 0) {
+    if(len != 96) {
+      printf("%d %.*s\n", len, len, buffer);
+    }
+  }
+
+  close(sockfd);
+  return 0;
 }
 
 static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
@@ -963,7 +1018,10 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
     }
     snprintf(topic, len+1, "panasonic_heat_pump/commands/%s", &var->token[1]);
 
-    mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
+    http_request((char *)&var->token[1], payload);
+
+    // mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
+
     FREE(topic);
     FREE(payload);
   }
@@ -1157,11 +1215,11 @@ void handle_signal(int s) {
 	run = 0;
 }
 
-void handle_alarm(int sig){
+void timer_cb(int nr) {
   struct timerqueue_t *node = NULL;
   struct itimerval it_val;
   char *name = NULL;
-  int i = 0, x = 0, sec = 0, usec = 0, nr = 0;
+  int i = 0, x = 0, sec = 0, usec = 0;
 
   /* Define temporary variables */
   time_t current_time;
@@ -1176,52 +1234,38 @@ void handle_alarm(int sig){
   /* Display the local time */
   printf("\n_______ %s %s ", __FUNCTION__, asctime(local_time));
 
-  if((node = timerqueue_pop()) != NULL) {
-    nr = node->nr;
-    FREE(node);
 
-    i = snprintf(NULL, 0, "timer=%d", nr);
-    if((name = (char *)MALLOC(i+2)) == NULL) {
-      OUT_OF_MEMORY
-    }
-    memset(name, 0, i+2);
-    snprintf(name, i+1, "timer=%d", nr);
-    printf("%s\n", name);
-    if((node = timerqueue_peek()) != NULL) {
-      if(node->sec <= 0 && node->usec <= 0) {
-        handle_alarm(0);
-      }
-      it_val.it_value.tv_sec = node->sec;
-      it_val.it_value.tv_usec = node->usec;
-      it_val.it_interval = it_val.it_value;
-      setitimer(ITIMER_REAL, &it_val, NULL);
-    }
-
-    for(x=0;x<nrrules;x++) {
-      if(get_event(rules[x]) > -1 && strcmp((char *)&rules[x]->ast.buffer[get_event(rules[x])+5], name) == 0) {
-      // if(strnicmp(name, (char *)&rules[x]->ast.buffer[1], strlen(name)) == 0) {
-        rule_run(rules[x], 0);
-        memset(&out, 0, 1024);
-        printf("\n>>> local variables\n");
-        vm_value_prt(rules[x], (char *)&out, 1024);
-        printf("%s",out);
-        printf("\n>>> global variables\n");
-        memset(&out, 0, 1024);
-        vm_global_value_prt((char *)&out, 1024);
-        printf("%s\n",out);
-
-        FREE(name);
-        return;
-      }
-    }
-    FREE(name);
-  } else {
-    printf("\n");
-    it_val.it_value.tv_sec = 0;
-    it_val.it_value.tv_usec = 0;
-    it_val.it_interval = it_val.it_value;
-    setitimer(ITIMER_REAL, &it_val, NULL);
+  i = snprintf(NULL, 0, "timer=%d", nr);
+  if((name = (char *)MALLOC(i+2)) == NULL) {
+    OUT_OF_MEMORY
   }
+  memset(name, 0, i+2);
+  snprintf(name, i+1, "timer=%d", nr);
+  printf("%s\n", name);
+  if((node = timerqueue_peek()) != NULL) {
+    if(node->sec <= 0 && node->usec <= 0) {
+      timer_cb(node->nr);
+    }
+  }
+
+  for(x=0;x<nrrules;x++) {
+    if(get_event(rules[x]) > -1 && strcmp((char *)&rules[x]->ast.buffer[get_event(rules[x])+5], name) == 0) {
+    // if(strnicmp(name, (char *)&rules[x]->ast.buffer[1], strlen(name)) == 0) {
+      rule_run(rules[x], 0);
+      memset(&out, 0, 1024);
+      printf("\n>>> local variables\n");
+      vm_value_prt(rules[x], (char *)&out, 1024);
+      printf("%s",out);
+      printf("\n>>> global variables\n");
+      memset(&out, 0, 1024);
+      vm_global_value_prt((char *)&out, 1024);
+      printf("%s\n",out);
+
+      FREE(name);
+      return;
+    }
+  }
+  FREE(name);
 }
 
 void connect_callback(struct mosquitto *mosq, void *obj, int result) {
@@ -1375,12 +1419,6 @@ int main(int argc, char **argv) {
     FREE(node);
   }
 
-  it_val.it_value.tv_sec = 0;
-  it_val.it_value.tv_usec = 0;
-  it_val.it_interval = it_val.it_value;
-  setitimer(ITIMER_REAL, &it_val, NULL);
-
-  signal(SIGALRM, handle_alarm);
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
@@ -1389,9 +1427,9 @@ int main(int argc, char **argv) {
   mosquitto_lib_init();
 
   if((mosq = mosquitto_new("HeishaDaemon3", true, NULL)) == NULL) {
-		OUT_OF_MEMORY
-	}
-  
+    OUT_OF_MEMORY
+  }
+
   mosquitto_log_callback_set(mosq, mosq_log_callback);
   mosquitto_connect_callback_set(mosq, connect_callback);
   mosquitto_message_callback_set(mosq, message_callback);
@@ -1404,13 +1442,12 @@ int main(int argc, char **argv) {
   int foo = 0;
   while(run){
     int rc = mosquitto_loop(mosq, -1, 1);
-
     if(foo == 0) {
       foo = 1;
       for(i=0;i<nrrules;i++) {
         if(get_event(rules[i]) > -1 && strcmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+5], "System#Boot") == 0) {
           printf("\n\n==== SYSTEM#BOOT ====\n\n");
-          rule_run(rules[i], 0); 
+          rule_run(rules[i], 0);
         }
       }
     }
@@ -1420,6 +1457,7 @@ int main(int argc, char **argv) {
       sleep(1);
       mosquitto_reconnect(mosq);
     }
+    timerqueue_update();
   }
 
   mosquitto_destroy(mosq);
@@ -1435,11 +1473,6 @@ int main(int argc, char **argv) {
     rules_gc(&rules, nrrules);
   }
   nrrules = 0;
-
-  it_val.it_value.tv_sec = 0;
-  it_val.it_value.tv_usec = 0;
-  it_val.it_interval = it_val.it_value;
-  setitimer(ITIMER_REAL, &it_val, NULL);
 
   while((node = timerqueue_pop()) != NULL) {
     FREE(node);

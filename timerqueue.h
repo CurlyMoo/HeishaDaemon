@@ -15,13 +15,16 @@ typedef struct timerqueue_t {
 	int sec;
 	int usec;
   int nr;
+  int remove;
 } timerqueue_t;
 
 extern struct timerqueue_t **timerqueue;
 extern int timerqueue_size;
+extern void timer_cb(int nr);
 
 struct timerqueue_t *timerqueue_pop();
 struct timerqueue_t *timerqueue_peek();
+void timerqueue_update(void);
 void timerqueue_insert(int sec, int usec, int nr);
 
 
