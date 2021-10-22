@@ -32,6 +32,7 @@
 #include "coalesce.h"
 #include "round.h"
 #include "settimer.h"
+#include "isset.h"
 
 struct rule_function_t rule_functions[] = {
   { "max", event_function_max_callback },
@@ -39,6 +40,7 @@ struct rule_function_t rule_functions[] = {
   { "coalesce", event_function_coalesce_callback },
   { "round", event_function_round_callback },
   { "setTimer", event_function_set_timer_callback },
+  { "isset", event_function_isset_callback },
 };
 
 int nr_rule_functions = sizeof(rule_functions)/sizeof(rule_functions[0]);

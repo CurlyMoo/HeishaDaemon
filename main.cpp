@@ -531,22 +531,30 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
   if(node->token[0] == '@') {
     for(i=0;i<NUMBER_OF_TOPICS;i++) {
       if(stricmp(topics[i], (char *)&node->token[1]) == 0) {
-        float var = atof(hp_values[i]);
-        float nr = 0;
-
-        // mosquitto_publish
-        if(modff(var, &nr) == 0) {
-          memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
-          vinteger.type = VINTEGER;
-          vinteger.value = (int)var;
-          printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)var);
-          return (unsigned char *)&vinteger;
+        if(strlen(hp_values[i]) == 0) {
+          memset(&vnull, 0, sizeof(struct vm_vnull_t));
+          vnull.type = VNULL;
+          vnull.ret = token;
+          printf("%s %s = NULL\n", __FUNCTION__, (char *)node->token);
+          return (unsigned char *)&vnull;
         } else {
-          memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
-          vfloat.type = VFLOAT;
-          vfloat.value = var;
-          printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
-          return (unsigned char *)&vfloat;
+          float var = atof(hp_values[i]);
+          float nr = 0;
+
+          // mosquitto_publish
+          if(modff(var, &nr) == 0) {
+            memset(&vinteger, 0, sizeof(struct vm_vinteger_t));
+            vinteger.type = VINTEGER;
+            vinteger.value = (int)var;
+            printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)var);
+            return (unsigned char *)&vinteger;
+          } else {
+            memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+            vfloat.type = VFLOAT;
+            vfloat.value = var;
+            printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
+            return (unsigned char *)&vfloat;
+          }
         }
       }
     }
@@ -574,20 +582,36 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
   }
   if(node->token[0] == '?') {
     if(stricmp((char *)&node->token[1], "temperature") == 0) {
-      float var = atof(th_values[0]);
-      memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
-      vfloat.type = VFLOAT;
-      vfloat.value = var;
-      printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
-      return (unsigned char *)&vfloat;
+      if(strlen(th_values[0]) == 0) {
+        memset(&vnull, 0, sizeof(struct vm_vnull_t));
+        vnull.type = VNULL;
+        vnull.ret = token;
+        printf("%s %s = NULL\n", __FUNCTION__, (char *)node->token);
+        return (unsigned char *)&vnull;
+      } else {
+        float var = atof(th_values[0]);
+        memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+        vfloat.type = VFLOAT;
+        vfloat.value = var;
+        printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
+        return (unsigned char *)&vfloat;
+      }
     }
     if(stricmp((char *)&node->token[1], "setpoint") == 0) {
-      float var = atof(th_values[1]);
-      memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
-      vfloat.type = VFLOAT;
-      vfloat.value = var;
-      printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
-      return (unsigned char *)&vfloat;
+      if(strlen(th_values[1]) == 0) {
+        memset(&vnull, 0, sizeof(struct vm_vnull_t));
+        vnull.type = VNULL;
+        vnull.ret = token;
+        printf("%s %s = NULL\n", __FUNCTION__, (char *)node->token);
+        return (unsigned char *)&vnull;
+      } else {
+        float var = atof(th_values[1]);
+        memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+        vfloat.type = VFLOAT;
+        vfloat.value = var;
+        printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
+        return (unsigned char *)&vfloat;
+      }
     }
   }
   return NULL;
@@ -1488,6 +1512,7 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, handle_signal);
 
   memset(&hp_values, 0, 255*NUMBER_OF_TOPICS);
+  memset(&th_values, 0, 255*2);
 
   mosquitto_lib_init();
 
