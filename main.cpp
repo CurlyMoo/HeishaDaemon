@@ -65,9 +65,11 @@ static int run = 1;
 
 static struct rules_t **rules = NULL;
 static int nrrules = 0;
+static int booting = 1;
 
 static char out[1024];
 char hp_values[NUMBER_OF_TOPICS][255];
+char th_values[2][255];
 
 typedef struct varstack_t {
   unsigned int nrbytes;
@@ -130,7 +132,7 @@ static int get_event(struct rules_t *obj) {
 
 static int is_variable(char *text, unsigned int *pos, unsigned int size) {
   int i = 1, x = 0, match = 0;
-  if(text[*pos] == '$' || text[*pos] == '#' || text[*pos] == '@' || text[*pos] == '%') {
+  if(text[*pos] == '$' || text[*pos] == '#' || text[*pos] == '@' || text[*pos] == '%' || text[*pos] == '?') {
     while(isalnum(text[*pos+i])) {
       i++;
     }
@@ -159,6 +161,20 @@ static int is_variable(char *text, unsigned int *pos, unsigned int size) {
           match = 1;
           break;
         }
+      }
+      if(match == 0) {
+        printf("err: %s %d\n", __FUNCTION__, __LINE__);
+        exit(-1);
+      }
+    }
+    if(text[*pos] == '?') {
+      if(strnicmp(&text[(*pos)+1], "temperature", strlen("temperature")) == 0) {
+        i = strlen("temperature")+1;
+        match = 1;
+      }
+      if(strnicmp(&text[(*pos)+1], "setpoint", strlen("setpoint")) == 0) {
+        i = strlen("setpoint")+1;
+        match = 1;
       }
       if(match == 0) {
         printf("err: %s %d\n", __FUNCTION__, __LINE__);
@@ -195,6 +211,21 @@ static int is_event(char *text, unsigned int *pos, unsigned int size) {
       exit(-1);
     }
 
+    return i;
+  }
+  if(text[*pos] == '?') {
+    if(strnicmp(&text[(*pos)+1], "temperature", strlen("temperature")) == 0) {
+      i = strlen("temperature")+1;
+      match = 1;
+    }
+    if(strnicmp(&text[(*pos)+1], "setpoint", strlen("setpoint")) == 0) {
+      i = strlen("setpoint")+1;
+      match = 1;
+    }
+    if(match == 0) {
+      printf("err: %s %d\n", __FUNCTION__, __LINE__);
+      exit(-1);
+    }
     return i;
   }
 
@@ -539,6 +570,24 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
       vinteger.value = (int)tm_struct->tm_mon + 1;
       printf("%s %s = %d\n", __FUNCTION__, (char *)node->token, (int)tm_struct->tm_mon + 1);
       return (unsigned char *)&vinteger;
+    }
+  }
+  if(node->token[0] == '?') {
+    if(stricmp((char *)&node->token[1], "temperature") == 0) {
+      float var = atof(th_values[0]);
+      memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+      vfloat.type = VFLOAT;
+      vfloat.value = var;
+      printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
+      return (unsigned char *)&vfloat;
+    }
+    if(stricmp((char *)&node->token[1], "setpoint") == 0) {
+      float var = atof(th_values[1]);
+      memset(&vfloat, 0, sizeof(struct vm_vfloat_t));
+      vfloat.type = VFLOAT;
+      vfloat.value = var;
+      printf("%s %s = %g\n", __FUNCTION__, (char *)node->token, var);
+      return (unsigned char *)&vfloat;
     }
   }
   return NULL;
@@ -1018,9 +1067,11 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
     }
     snprintf(topic, len+1, "panasonic_heat_pump/commands/%s", &var->token[1]);
 
-    http_request((char *)&var->token[1], payload);
+    if(booting == 0) {
+      http_request((char *)&var->token[1], payload);
 
-    // mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
+      // mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
+    }
 
     FREE(topic);
     FREE(payload);
@@ -1272,41 +1323,55 @@ void connect_callback(struct mosquitto *mosq, void *obj, int result) {
 	printf("connect callback, rc=%d\n\n", result);
 
 	mosquitto_subscribe(mosq, NULL, topic, 0);
-	mosquitto_subscribe(mosq, NULL, "woonkamer/temperature/temperature", 0);
+	mosquitto_subscribe(mosq, NULL, "woonkamer/thermostaat/#", 0);
 }
 
 void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message) {
-  int i = 0, offset = strlen("panasonic_heat_pump/main");
+  int i = 0, offset_wp = strlen("panasonic_heat_pump/main");
   const char *topic = message->topic;
 
-  /*
-   * This value has been overridden so ignore.
-   */
-  if(strstr(message->topic, "panasonic_heat_pump/main/Room_Thermostat_Temp") != NULL) {
-    return;
-  }
-  if(strstr(message->topic, "woonkamer/temperature/temperature") != NULL) {
-    topic = "panasonic_heat_pump/main/Room_Thermostat_Temp";
-  }
+  // /*
+   // * This value has been overridden so ignore.
+   // */
+  // if(strstr(message->topic, "panasonic_heat_pump/main/Room_Thermostat_Temp") != NULL) {
+    // return;
+  // }
+  // if(strstr(message->topic, "woonkamer/temperature/temperature") != NULL) {
+    // topic = "panasonic_heat_pump/main/Room_Thermostat_Temp";
+  // }
 
   for(i=0;i<NUMBER_OF_TOPICS;i++) {
     if(strstr(topic, "panasonic_heat_pump/main") != NULL) {
-      if(strcmp(topics[i], &topic[offset+1]) == 0) {
+      if(strcmp(topics[i], &topic[offset_wp+1]) == 0) {
         strcpy(hp_values[i], (char *)message->payload);
       }
     }
+  }
+  if(strstr(topic, "woonkamer/thermostaat/temperatuur") != NULL) {
+    topic = "woonkamer/thermostaat/temperature";
+  }
+
+  if(strstr(topic, "woonkamer/thermostaat/temperature") != NULL) {
+    strcpy(th_values[0], (char *)message->payload);
+  }
+  if(strstr(topic, "woonkamer/thermostaat/setpoint") != NULL) {
+    strcpy(th_values[1], (char *)message->payload);
   }
 
   // printf(">>> global varstack nrbytes: %d\n", global_varstack.nrbytes);
 
   if(message->retain == 0 && (
         strstr(topic, "panasonic_heat_pump/main") != NULL ||
-        strstr(topic, "woonkamer/temperature/temperature") != NULL
+        strstr(topic, "woonkamer/thermostaat") != NULL
       )
     ) {
     for(i=0;i<nrrules;i++) {
-      if(get_event(rules[i]) > -1 && rules[i]->ast.buffer[get_event(rules[i])+5] == '@' &&
-        strnicmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+6], (char *)&topic[offset+1], strlen(&topic[offset+1])) == 0) {
+      if(get_event(rules[i]) > -1 &&
+        (
+          (rules[i]->ast.buffer[get_event(rules[i])+5] == '@' && strnicmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+6], (char *)&topic[offset_wp+1], strlen(&topic[offset_wp+1])) == 0) ||
+          (rules[i]->ast.buffer[get_event(rules[i])+5] == '?' && strnicmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+6], (char *)"temperature", strlen("temperature")) == 0) ||
+          (rules[i]->ast.buffer[get_event(rules[i])+5] == '?' && strnicmp((char *)&rules[i]->ast.buffer[get_event(rules[i])+6], (char *)"setpoint", strlen("setpoint")) == 0)
+        )) {
         printf("\n\n==== %s ====\n\n", (char *)&rules[i]->ast.buffer[get_event(rules[i])+6]);
         printf("\n");
         printf(">>> rule %d nrbytes: %d\n", i, rules[i]->ast.nrbytes);
@@ -1438,6 +1503,8 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Unable to connect to mqtt broker\n");
 		exit(1);
 	}
+
+  booting = 0;
 
   int foo = 0;
   while(run){
