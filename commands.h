@@ -53,7 +53,8 @@ struct {
   { "SetZ1WaterTemp" },
   { "SetZ2RoomTemp" },
   { "SetZ2WaterTemp" },
-  { "SetSolarTemp" }
+  { "SetSolarTemp" },
+  { "SetMaxPumpDuty" },
 };
 
 extern void setCommand(struct rules_t *obj, uint16_t step, uint16_t pos);

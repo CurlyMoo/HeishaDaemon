@@ -339,39 +339,7 @@ static void vm_value_cpy(struct rules_t *obj, uint16_t token) {
       }
     }
   } else if(var->token[0] == '#') {
-
     varstack = &global_varstack;
-    // for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
-      // x = alignedbytes(x);
-      // // printf("-- %d\n", x);
-      // switch(varstack->stack[x]) {
-        // case VINTEGER: {
-          // struct vm_vinteger_t *val = (struct vm_vinteger_t *)&varstack->stack[x];
-          // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vinteger_t)];
-          // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-
-          // x += sizeof(struct vm_vinteger_t)+sizeof(int)-1;
-        // } break;
-        // case VFLOAT: {
-          // struct vm_vfloat_t *val = (struct vm_vfloat_t *)&varstack->stack[x];
-          // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vfloat_t)];
-          // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-
-          // x += sizeof(struct vm_vfloat_t)+sizeof(int)-1;
-        // } break;
-        // case VNULL: {
-          // struct vm_vnull_t *val = (struct vm_vnull_t *)&varstack->stack[x];
-          // int rule = *(int *)&varstack->stack[x+sizeof(struct vm_vnull_t)];
-          // struct vm_tvar_t *foo = (struct vm_tvar_t *)&rules[rule-1]->bytecode[val->ret];
-
-          // x += sizeof(struct vm_vnull_t)+sizeof(int)-1;
-        // } break;
-        // default: {
-          // printf("err: %s %d\n", __FUNCTION__, __LINE__);
-          // exit(-1);
-        // } break;
-      // }
-    // }
 
     for(x=4;alignedbytes(x)<varstack->nrbytes;x++) {
       x = alignedbytes(x);
@@ -428,8 +396,6 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
     struct varstack_t *varstack = (struct varstack_t *)obj->userdata;
     if(obj->valstack.buffer[node->value] == 0) {
       int ret = varstack->nrbytes, suffix = 0;
-
-      // printf(".. %s %d %d\n", __FUNCTION__, __LINE__, ret);
       unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_vnull_t));
       if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -471,7 +437,6 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
     if(obj->valstack.buffer[node->value] == 0) {
       int ret = varstack->nrbytes, suffix = 0;
 
-      // printf(".. %s %d %d\n", __FUNCTION__, __LINE__, ret);
       unsigned int size = alignedbytes(varstack->nrbytes + sizeof(struct vm_gvnull_t));
       if((varstack->stack = (unsigned char *)REALLOC(varstack->stack, size)) == NULL) {
         OUT_OF_MEMORY /*LCOV_EXCL_LINE*/
@@ -484,7 +449,6 @@ static unsigned char *vm_value_get(struct rules_t *obj, uint16_t token) {
 
       varstack->nrbytes = size;
     }
-
 
     const char *key = (char *)node->token;
     switch(varstack->stack[obj->valstack.buffer[node->value]]) {
@@ -690,58 +654,58 @@ static int vm_value_del(struct rules_t *obj, uint16_t idx) {
   return ret;
 }
 
-static int http_request(char *name, char *value) {
-  char buffer[1024] = {0};
-	struct sockaddr_in serv_addr;
+// static int http_request(char *name, char *value) {
+  // char buffer[1024] = {0};
+	// struct sockaddr_in serv_addr;
 
-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	memset(&serv_addr, '0', sizeof(serv_addr));
+  // int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	// memset(&serv_addr, '0', sizeof(serv_addr));
 
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(80);
-  inet_pton(AF_INET, "10.0.2.124", &serv_addr.sin_addr);
+	// serv_addr.sin_family = AF_INET;
+	// serv_addr.sin_port = htons(80);
+  // inet_pton(AF_INET, "10.0.2.124", &serv_addr.sin_addr);
 
-  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    fprintf(stderr, "failed to connect to server\n");
-    return -1;
-  }
+  // if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    // fprintf(stderr, "failed to connect to server\n");
+    // return -1;
+  // }
 
-  struct timeval timeout;
-  timeout.tv_sec = 10;
-  timeout.tv_usec = 0;
+  // struct timeval timeout;
+  // timeout.tv_sec = 10;
+  // timeout.tv_usec = 0;
 
-  if(setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-    fprintf(stderr, "setsockopt failed\n");
-    return -1;
-  }
+  // if(setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+    // fprintf(stderr, "setsockopt failed\n");
+    // return -1;
+  // }
 
-  if(setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
-    fprintf(stderr, "setsockopt failed\n");
-    return -1;
-  }
+  // if(setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+    // fprintf(stderr, "setsockopt failed\n");
+    // return -1;
+  // }
 
-  unsigned int len = snprintf(buffer, 1024,
-    "GET /command?%s=%s HTTP/1.0\r\n"
-    "Host: 10.0.2.124\r\n"
-    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0\r\n"
-    "\r\n", name, value);
+  // int len = snprintf(buffer, 1024,
+    // "GET /command?%s=%s HTTP/1.0\r\n"
+    // "Host: 10.0.2.124\r\n"
+    // "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:92.0) Gecko/20100101 Firefox/92.0\r\n"
+    // "\r\n", name, value);
 
-  if(send(sockfd, buffer, len, 0) != len) {
-    fprintf(stderr, "failed send message");
-    return -1;
-  }
+  // if(send(sockfd, buffer, len, 0) != len) {
+    // fprintf(stderr, "failed send message");
+    // return -1;
+  // }
 
-  memset(&buffer, 0, 1024);
+  // memset(&buffer, 0, 1024);
 
-  while((len = read(sockfd, &buffer, 1024)) > 0) {
-    if(len != 96) {
-      printf("%d %.*s\n", len, len, buffer);
-    }
-  }
+  // while((len = read(sockfd, &buffer, 1024)) > 0) {
+    // if(len != 96) {
+      // printf("%d %.*s\n", len, len, buffer);
+    // }
+  // }
 
-  close(sockfd);
-  return 0;
-}
+  // close(sockfd);
+  // return 0;
+// }
 
 static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
   struct varstack_t *varstack = NULL;
@@ -1092,9 +1056,9 @@ static void vm_value_set(struct rules_t *obj, uint16_t token, uint16_t val) {
     snprintf(topic, len+1, "panasonic_heat_pump/commands/%s", &var->token[1]);
 
     if(booting == 0) {
-      http_request((char *)&var->token[1], payload);
+      // http_request((char *)&var->token[1], payload);
 
-      // mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
+      mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, 0, 0);
     }
 
     FREE(topic);

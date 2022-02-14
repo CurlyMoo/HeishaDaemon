@@ -20,7 +20,7 @@
 // String getHeatMode(byte input);
 // String getModel(byte input);
 
-#define NUMBER_OF_TOPICS 94 //last topic number + 1
+#define NUMBER_OF_TOPICS 96 //last topic number + 1
 
 static const char * topics[] = {
   "Heatpump_State",          //TOP0
@@ -117,4 +117,6 @@ static const char * topics[] = {
   "DHW_Heater_Operations_Hours",  //TOP91
   "Heat_Pump_Model", //TOP92,
   "Pump_Duty", //TOP93
+  "Zones_State", //TOP94
+  "Max_Pump_Duty", //TOP95
 };

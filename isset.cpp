@@ -26,8 +26,6 @@ int event_function_isset_callback(struct rules_t *obj, uint16_t argc, uint16_t *
 #endif
 /* LCOV_EXCL_STOP*/
 
-  *ret = obj->varstack.nrbytes;
-
   if(argc != 1) {
     return -1;
   }
@@ -53,7 +51,6 @@ int event_function_isset_callback(struct rules_t *obj, uint16_t argc, uint16_t *
 
   obj->varstack.nrbytes = size;
   obj->varstack.bufsize = alignedbuffer(size);
-
 
   return 0;
 }
